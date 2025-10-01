@@ -1,0 +1,2459 @@
+from django.shortcuts import render,redirect,reverse
+from . import forms,models
+from django.db.models import Sum
+from django.contrib.auth.models import Group
+from django.http import HttpResponseRedirect
+from django.contrib.auth.decorators import login_required,user_passes_test
+from django.conf import settings
+from datetime import date, timedelta
+from django.db.models import Q
+from django.core.mail import send_mail
+from student import models as SMODEL
+from student import forms as SFORM
+from django.contrib.auth.models import User
+from django.contrib.auth import logout
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from typing import Tuple, Dict
+from django.http import JsonResponse, FileResponse, HttpResponse
+from django.db import transaction
+from django.core.paginator import Paginator
+from django.shortcuts import get_object_or_404
+from .forms import PDFUploadForm
+from .utils import parse_pdf_questions
+import os
+from .models import StudentAnswer
+import json
+from django.utils import timezone
+from django.utils.text import slugify
+from django.db.models import Max
+from .models import QuestionTimeLog
+from .models import Assignment, AssignmentAttempt
+from .models import Note, Batch
+import shutil
+import re
+# Removed old import - PDF processing now handled by pdf_processor.py
+
+
+def home_view(request):
+    if request.user.is_authenticated:
+        return HttpResponseRedirect('afterlogin')  
+    return render(request,'exam/index.html')
+
+
+def is_student(user):
+    return user.groups.filter(name='STUDENT').exists()
+
+# Admin access helper: allow superuser, staff, or members of 'ADMIN' group
+def is_admin(user):
+    try:
+        if getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False):
+            return True
+        return user.groups.filter(name='ADMIN').exists()
+    except Exception:
+        return False
+
+def afterlogin_view(request):
+    if is_student(request.user):      
+        # Redirect students directly to the exam listing page
+        return redirect('student-exam')
+    else:
+        return redirect('admin-dashboard')
+
+
+
+def adminclick_view(request):
+    if request.user.is_authenticated:
+        return HttpResponseRedirect('afterlogin')
+    return HttpResponseRedirect('adminlogin')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_dashboard_view(request):
+    dict={
+    'total_student':SMODEL.Student.objects.all().count(),
+    'total_course':models.Course.objects.all().count(),
+    'total_question':models.Question.objects.all().count(),
+    }
+    return render(request,'exam/admin_dashboard.html',context=dict)
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_student_view(request):
+    dict={
+    'total_student':SMODEL.Student.objects.all().count(),
+    }
+    return render(request,'exam/admin_student.html',context=dict)
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_student_view(request):
+    students= SMODEL.Student.objects.all()
+    # Group by batch for rendering with an aggregated 'Emergency Batches' at the end
+    BASE_BATCHES = ['11th CET','11th NEET','11th JEE','12th CET','12th NEET','12th JEE']
+    EMERGENCY_BATCHES = {
+        '11th Emergency 1', '11th Emergency 2', '12th Emergency 1', '12th Emergency 2'
+    }
+    DISPLAY_BATCHES = BASE_BATCHES + ['Emergency Batches']
+    students_by_batch = {b: [] for b in DISPLAY_BATCHES}
+    for s in students:
+        key = getattr(s, 'batch', None)
+        if key in BASE_BATCHES:
+            students_by_batch[key].append(s)
+        elif key in EMERGENCY_BATCHES:
+            students_by_batch['Emergency Batches'].append(s)
+        else:
+            # Unknown/missing batch go to first section to preserve visibility
+            students_by_batch[BASE_BATCHES[0]].append(s)
+    return render(request,'exam/admin_view_student.html',{
+        'students': students,
+        'students_by_batch': students_by_batch,
+        'batches': DISPLAY_BATCHES,
+    })
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_student_statistics_view(request):
+    """Batch-wise listing reused for Statistics landing page."""
+    students = SMODEL.Student.objects.all().select_related('user')
+    BATCHES = ['11th CET','11th NEET','11th JEE','12th CET','12th NEET','12th JEE']
+    students_by_batch = {b: [] for b in BATCHES}
+    for s in students:
+        key = getattr(s, 'batch', None)
+        if key in students_by_batch:
+            students_by_batch[key].append(s)
+        else:
+            students_by_batch[BATCHES[0]].append(s)
+    return render(request,'exam/admin_student_statistics.html',{
+        'students': students,
+        'students_by_batch': students_by_batch,
+        'batches': BATCHES,
+        'is_statistics': True,
+    })
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_student_statistics_detail_view(request, student_id: int):
+    """Show per-student statistics with charts, computed live from answers/results."""
+    from collections import defaultdict
+    try:
+        student = SMODEL.Student.objects.select_related('user').get(id=student_id)
+    except SMODEL.Student.DoesNotExist:
+        return render(request, 'exam/admin_view_student.html', {
+            'error': 'Student not found.'
+        })
+
+    # Subjects considered
+    SUBJECTS = ['Physics', 'Chemistry', 'Maths', 'Biology', 'General']
+    # All courses attempted by the student (by existence of Result)
+    results = models.Result.objects.filter(student=student).select_related('exam')
+    course_ids = [r.exam_id for r in results]
+    # All questions and answers for these courses
+    questions = models.Question.objects.filter(course_id__in=course_ids)
+    answers = models.StudentAnswer.objects.filter(student=student, exam_id__in=course_ids)
+    ans_by_qid = {a.question_id: a for a in answers}
+
+    # Aggregate subject-wise totals
+    subj_totals = {s: {'obtained': 0, 'possible': 0, 'attempted': 0, 'correct': 0, 'incorrect': 0} for s in SUBJECTS}
+    per_course_subject_pct = defaultdict(lambda: {s: None for s in SUBJECTS})
+    # Compute per-course subject totals for trend graph
+    per_course_keyed = defaultdict(lambda: defaultdict(lambda: {'obt': 0, 'poss': 0, 'correct': 0, 'incorrect': 0}))
+
+    # Determine per-course per-question marks
+    course_per_q = {}
+    for r in results:
+        per_q = getattr(r.exam, 'marks_per_question', None) or 1
+        course_per_q[r.exam_id] = per_q
+
+    for q in questions:
+        subj = q.subject if q.subject in SUBJECTS else 'General'
+        per_q = course_per_q.get(q.course_id, 1)
+        a = ans_by_qid.get(q.id)
+        if a and a.selected_option:
+            subj_totals[subj]['attempted'] += 1
+            if a.selected_option == q.correct_answer:
+                subj_totals[subj]['correct'] += 1
+                subj_totals[subj]['obtained'] += per_q
+            else:
+                subj_totals[subj]['incorrect'] += 1
+        # Possible increases regardless of attempt (question exists in that subject)
+        subj_totals[subj]['possible'] += per_q
+        # Per-course bucket
+        bucket = per_course_keyed[q.course_id][subj]
+        bucket['poss'] += per_q
+        if a and a.selected_option:
+            if a.selected_option == q.correct_answer:
+                bucket['obt'] += per_q
+                bucket['correct'] += 1
+            else:
+                bucket['incorrect'] += 1
+
+    # Build trend series by course date (or course id if no date)
+    # We will sort results by their auto-updated date field
+    ordered_results = sorted(results, key=lambda r: (getattr(r, 'date', None) or r.id))
+    trend_labels = []
+    trend_by_subject = {s: [] for s in SUBJECTS}
+    for r in ordered_results:
+        label = f"{r.exam.course_name}"
+        trend_labels.append(label)
+        subj_map = per_course_keyed.get(r.exam_id, {})
+        for s in SUBJECTS:
+            data = subj_map.get(s, {'obt': 0, 'poss': 0})
+            pct = round((data['obt'] / data['poss'] * 100.0), 2) if data['poss'] > 0 else None
+            trend_by_subject[s].append(pct)
+            per_course_subject_pct[r.exam_id][s] = pct
+
+    # Compute batch averages per subject for comparison
+    batch_students = SMODEL.Student.objects.filter(batch=student.batch)
+    batch_results = models.Result.objects.filter(student__in=batch_students)
+    batch_course_ids = batch_results.values_list('exam_id', flat=True)
+    batch_questions = models.Question.objects.filter(course_id__in=batch_course_ids)
+    # map course -> per_q
+    batch_courses = models.Course.objects.filter(id__in=batch_course_ids)
+    b_per_q = {c.id: (getattr(c, 'marks_per_question', None) or 1) for c in batch_courses}
+    # student count per subject with data and aggregate totals
+    batch_subj_totals = {s: {'obt': 0, 'poss': 0} for s in SUBJECTS}
+    batch_answers = models.StudentAnswer.objects.filter(student__in=batch_students, exam_id__in=batch_course_ids)
+    b_ans_by_q = {}
+    for a in batch_answers:
+        b_ans_by_q.setdefault(a.question_id, []).append(a)
+    for q in batch_questions:
+        subj = q.subject if q.subject in SUBJECTS else 'General'
+        per_q = b_per_q.get(q.course_id, 1)
+        # Each answer contributes to obtained if correct
+        for a in b_ans_by_q.get(q.id, []):
+            if a.selected_option:
+                if a.selected_option == q.correct_answer:
+                    batch_subj_totals[subj]['obt'] += per_q
+                # possible for batch increases by per_q per student who attempted/answered
+                batch_subj_totals[subj]['poss'] += per_q
+
+    # Prepare data for charts
+    subjects_for_ui = [s for s in SUBJECTS if s != 'General'] or SUBJECTS
+    subj_obtained = [subj_totals[s]['obtained'] for s in subjects_for_ui]
+    subj_possible = [subj_totals[s]['possible'] for s in subjects_for_ui]
+    subj_pct = [round((o/p*100.0),2) if p>0 else None for o,p in zip(subj_obtained, subj_possible)]
+    batch_pct = []
+    for s in subjects_for_ui:
+        obt = batch_subj_totals[s]['obt']
+        poss = batch_subj_totals[s]['poss']
+        batch_pct.append(round((obt/poss*100.0),2) if poss>0 else None)
+
+    # Strength/Weakness: top 2 and bottom 2 by percentage
+    pairs = [(s, pct if pct is not None else -1) for s, pct in zip(subjects_for_ui, subj_pct)]
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    strengths = [p[0] for p in pairs if p[1] >= 0][:2]
+    weaknesses = [p[0] for p in reversed(pairs) if p[1] >= 0][:2]
+
+    context = {
+        'student': student,
+        'subjects': subjects_for_ui,
+        'subj_pct': subj_pct,
+        'batch_pct': batch_pct,
+        'trend_labels': trend_labels,
+        'trend_by_subject': trend_by_subject,
+        'strengths': strengths,
+        'weaknesses': weaknesses,
+        'subj_totals': subj_totals,
+    }
+    return render(request,'exam/admin_student_statistics_detail.html', context)
+
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def update_student_view(request, pk):
+    """Update basic user and student fields; password is optional."""
+    try:
+        student = SMODEL.Student.objects.get(id=pk)
+    except SMODEL.Student.DoesNotExist:
+        return redirect('admin-view-student')
+    try:
+        user = User.objects.get(id=student.user_id)
+    except User.DoesNotExist:
+        return redirect('admin-view-student')
+
+    userForm = SFORM.StudentUserUpdateForm(instance=user)
+    studentForm = SFORM.StudentForm(instance=student)
+    if request.method == 'POST':
+        userForm = SFORM.StudentUserUpdateForm(request.POST, instance=user)
+        studentForm = SFORM.StudentForm(request.POST, request.FILES, instance=student)
+        if userForm.is_valid() and studentForm.is_valid():
+            u = userForm.save(commit=False)
+            new_pwd = userForm.cleaned_data.get('password')
+            if new_pwd:
+                u.set_password(new_pwd)
+            u.save()
+            studentForm.save()
+            return redirect('admin-view-student')
+    return render(request, 'exam/update_student.html', {'userForm': userForm, 'studentForm': studentForm})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def delete_student_view(request, pk):
+    """Delete a student and its auth user, then redirect to admin-view-student."""
+    try:
+        student = SMODEL.Student.objects.get(id=pk)
+    except SMODEL.Student.DoesNotExist:
+        return redirect('admin-view-student')
+    try:
+        user = User.objects.get(id=student.user_id)
+        user.delete()
+    except User.DoesNotExist:
+        # If user missing, delete student directly
+        student.delete()
+    else:
+        # Deleting user should cascade; ensure student gone
+        try:
+            student.refresh_from_db()
+        except SMODEL.Student.DoesNotExist:
+            pass
+    return redirect('admin-view-student')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def delete_batch_view(request, batch):
+    """Delete all students in a batch (and their auth users). POST only for safety."""
+    if request.method != 'POST':
+        return redirect('admin-view-student')
+    BATCHES = {
+        '11th CET','11th NEET','11th JEE','12th CET','12th NEET','12th JEE',
+        '11th Emergency 1','11th Emergency 2','12th Emergency 1','12th Emergency 2'
+    }
+    if batch not in BATCHES:
+        return redirect('admin-view-student')
+    qs = SMODEL.Student.objects.filter(batch=batch).select_related('user')
+    for s in qs:
+        try:
+            if s.user_id:
+                s.user.delete()
+            else:
+                s.delete()
+        except Exception:
+            pass
+    return redirect('admin-view-student')
+
+
+# =====================
+# Notes (Admin & Student)
+# =====================
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_notes_home_view(request):
+    return render(request, 'exam/admin_notes_home.html')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_add_note_view(request):
+    # Fixed batches to display as checkboxes
+    FIXED_BATCHES = ['11th CET', '11th JEE', '11th NEET', '12th CET', '12th JEE', '12th NEET']
+    error = None
+    success = None
+    saved_note = None
+    selected_batches = []
+    if request.method == 'POST':
+        title = (request.POST.get('title') or '').strip()
+        desc = (request.POST.get('description') or '').strip()
+        # We receive batch names from checkbox values
+        batch_names = request.POST.getlist('batches')
+        # If 'ALL' selected, expand to all fixed batches
+        if 'ALL' in batch_names:
+            batch_names = FIXED_BATCHES[:]
+        selected_batches = batch_names[:]
+        upload = request.FILES.get('file')
+        # Validation
+        if not batch_names:
+            error = 'Please select at least one Batch.'
+        elif not title:
+            error = 'Please enter a title for the note.'
+        elif not upload:
+            error = 'Please choose a PDF file to upload.'
+        else:
+            # Server-side PDF validations (size + magic bytes)
+            try:
+                from .models import validate_pdf_file
+                validate_pdf_file(upload)
+            except Exception as e:
+                error = str(e)
+        if not error:
+            # Create note and attach batches
+            n = Note(title=title, description=desc or None, uploaded_by=request.user)
+            # Slug will be auto-generated on save()
+            n.file = upload
+            n.save()
+            # M2M batches using names (create if missing)
+            sel_batches = []
+            for name in batch_names:
+                if name in FIXED_BATCHES:
+                    b, _ = Batch.objects.get_or_create(name=name)
+                    sel_batches.append(b)
+            if sel_batches:
+                n.batches.set(sel_batches)
+            n.save()
+            saved_note = n
+            success = 'Note uploaded successfully.'
+    context = {
+        'fixed_batches': FIXED_BATCHES,
+        'selected_batches': selected_batches,
+        'error': error,
+        'success': success,
+        'saved_note': saved_note,
+    }
+    return render(request, 'exam/admin_add_note.html', context)
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_browse_notes_view(request):
+    # Filters
+    FIXED_BATCHES = ['ALL', '11th CET', '11th JEE', '11th NEET', '12th CET', '12th JEE', '12th NEET']
+    selected_batch = (request.GET.get('batch') or 'ALL').strip()
+    q = (request.GET.get('q') or '').strip()
+    notes = Note.objects.all().select_related('uploaded_by').prefetch_related('batches').order_by('-uploaded_at', '-id')
+    if selected_batch and selected_batch != 'ALL':
+        notes = notes.filter(batches__name=selected_batch)
+    if q:
+        notes = notes.filter(title__icontains=q)
+    paginator = Paginator(notes, 10)
+    page_num = request.GET.get('page') or 1
+    page = paginator.get_page(page_num)
+    return render(request, 'exam/admin_browse_notes.html', {
+        'page': page,
+        'paginator': paginator,
+        'fixed_batches': FIXED_BATCHES,
+        'selected_batch': selected_batch,
+        'q': q,
+    })
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_note_pdf(request, slug: str):
+    note = get_object_or_404(Note, slug=slug)
+    # Stream the PDF with correct headers; rely on auth checks above
+    if not note.file:
+        return HttpResponse('File not found.', status=404)
+    response = FileResponse(note.file.open('rb'), content_type='application/pdf')
+    response['X-Frame-Options'] = 'SAMEORIGIN'
+    # Do not force download; allow inline display
+    response['Content-Disposition'] = f'inline; filename="{os.path.basename(note.file.name)}"'
+    return response
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_delete_note_view(request, note_id: int):
+    if request.method != 'POST':
+        return redirect('admin-notes-browse')
+    note = get_object_or_404(Note, id=note_id)
+    try:
+        if note.file:
+            note.file.delete(save=False)
+    except Exception:
+        pass
+    note.delete()
+    return redirect('admin-notes-browse')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_replace_note_view(request, note_id: int):
+    note = get_object_or_404(Note, id=note_id)
+    error = None
+    success = None
+    if request.method == 'POST':
+        upload = request.FILES.get('file')
+        if not upload:
+            error = 'Please choose a PDF file to upload.'
+        else:
+            try:
+                from .models import validate_pdf_file
+                validate_pdf_file(upload)
+            except Exception as e:
+                error = str(e)
+        if not error:
+            # Remove old file then assign new
+            try:
+                if note.file:
+                    note.file.delete(save=False)
+            except Exception:
+                pass
+            note.file = upload
+            note.save()
+            success = 'Note file replaced successfully.'
+            return redirect('admin-notes-browse')
+    return render(request, 'exam/admin_replace_note.html', {'note': note, 'error': error, 'success': success})
+
+
+@login_required(login_url='studentlogin')
+@user_passes_test(lambda u: u.is_authenticated and u.groups.filter(name='STUDENT').exists())
+def student_notes_list_view(request):
+    # List notes where student's batch intersects note.batches
+    try:
+        me = SMODEL.Student.objects.get(user_id=request.user.id)
+        my_batch = me.batch
+    except SMODEL.Student.DoesNotExist:
+        return HttpResponse('Student profile not found.', status=404)
+    notes = Note.objects.filter(batches__name=my_batch).select_related('uploaded_by').distinct().order_by('-uploaded_at', '-id')
+    q = (request.GET.get('q') or '').strip()
+    if q:
+        notes = notes.filter(title__icontains=q)
+    paginator = Paginator(notes, 10)
+    page_num = request.GET.get('page') or 1
+    page = paginator.get_page(page_num)
+    return render(request, 'student/notes_list.html', {
+        'page': page,
+        'paginator': paginator,
+        'q': q,
+    })
+
+
+@login_required(login_url='studentlogin')
+@user_passes_test(lambda u: u.is_authenticated and u.groups.filter(name='STUDENT').exists())
+def student_view_note_pdf(request, slug: str):
+    note = get_object_or_404(Note, slug=slug)
+    # Enforce access: student must belong to at least one of note.batches
+    try:
+        me = SMODEL.Student.objects.get(user_id=request.user.id)
+        my_batch = me.batch
+    except SMODEL.Student.DoesNotExist:
+        return HttpResponse('Student profile not found.', status=404)
+    if not note.batches.filter(name=my_batch).exists():
+        return HttpResponse('You do not have access to this note.', status=403)
+    if not note.file:
+        return HttpResponse('File not found.', status=404)
+    response = FileResponse(note.file.open('rb'), content_type='application/pdf')
+    response['X-Frame-Options'] = 'SAMEORIGIN'
+    response['Content-Disposition'] = f'inline; filename="{os.path.basename(note.file.name)}"'
+    return response
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_course_view(request):
+    return render(request,'exam/admin_course.html')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_add_course_view(request):
+    courseForm=forms.CourseForm()
+    if request.method=='POST':
+        courseForm=forms.CourseForm(request.POST)
+        if courseForm.is_valid():        
+            course = courseForm.save(commit=False)
+            course.status = 'draft'
+            # Handle multi-batch input: expect list under 'batches'
+            selected_batches = request.POST.getlist('batches') or []
+            if selected_batches:
+                course.batches = ','.join(selected_batches)
+                # Keep legacy single 'batch' as the first selection for backward compatibility
+                course.batch = selected_batches[0]
+            course.save()
+        else:
+            print("form is invalid")
+        return HttpResponseRedirect('/admin-view-course')
+    # Provide batch choices for multi-select UI
+    batch_choices = getattr(models.Course, 'BATCH_CHOICES', [])
+    return render(request,'exam/admin_add_course.html',{'courseForm':courseForm, 'batch_choices': batch_choices})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_course_view(request):
+    courses = models.Course.objects.all().order_by('-id')  # Latest first
+    return render(request,'exam/admin_view_course.html',{'courses':courses})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_edit_course_view(request, pk: int):
+    """Allow admin to update marks per question for a test in one place.
+    Recalculates total marks based on current number of questions.
+    Keeps other functionality intact.
+    """
+    try:
+        course = models.Course.objects.get(id=pk)
+    except models.Course.DoesNotExist:
+        return redirect('admin-view-course')
+
+    if request.method == 'POST':
+        try:
+            per_q_raw = request.POST.get('marks_per_question', '').strip()
+            per_q = int(per_q_raw)
+            if per_q < 1:
+                raise ValueError('Marks per question must be at least 1')
+        except Exception:
+            # Re-render with error
+            context = {
+                'course': course,
+                'error': 'Please enter a valid number (>= 1) for Marks per Question.',
+                'batch_choices': getattr(models.Course, 'BATCH_CHOICES', []),
+                'selected_batches': course.get_batches_list() if hasattr(course, 'get_batches_list') else [getattr(course, 'batch', None)],
+            }
+            return render(request, 'exam/admin_edit_course.html', context)
+
+        # Compute current question count from DB to guarantee consistency
+        qcount = models.Question.objects.filter(course=course).count()
+        # Update fields
+        course.marks_per_question = per_q
+        # Optional edits: name and duration
+        new_name = (request.POST.get('course_name') or course.course_name).strip()
+        if new_name:
+            course.course_name = new_name
+        try:
+            new_duration = int(request.POST.get('duration_minutes') or course.duration_minutes)
+            if new_duration > 0:
+                course.duration_minutes = new_duration
+        except Exception:
+            pass
+        # Multi-batch edits
+        selected_batches = request.POST.getlist('batches') or []
+        if selected_batches:
+            course.batches = ','.join(selected_batches)
+            course.batch = selected_batches[0]
+        # Keep the course.question_number in sync with reality (in case it drifted)
+        course.question_number = qcount
+        course.total_marks = qcount * per_q
+        course.save()
+        # Also sync each Question.marks to the new per-question marks in a single bulk update
+        models.Question.objects.filter(course=course).update(marks=per_q)
+        return redirect('admin-view-course')
+
+    # GET
+    context = {
+        'course': course,
+        'batch_choices': getattr(models.Course, 'BATCH_CHOICES', []),
+        'selected_batches': course.get_batches_list() if hasattr(course, 'get_batches_list') else [getattr(course, 'batch', None)],
+    }
+    return render(request, 'exam/admin_edit_course.html', context)
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def delete_course_view(request,pk):
+    course=models.Course.objects.get(id=pk)
+    # Local sanitize mirroring models.question_image_upload_path
+    def _sanitize(value: str) -> str:
+        value = re.sub(r'[^a-zA-Z0-9_]', '_', value or '')
+        value = re.sub(r'_+', '_', value)
+        value = value.strip('_') or 'unknown'
+        return value
+    # Delete associated question image files from storage before cascading delete
+    try:
+        from django.core.files.storage import default_storage
+        qs = models.Question.objects.filter(course=course)
+        # Collect possible directories to clean up later
+        questions_root = os.path.join(settings.MEDIA_ROOT, 'questions')
+        legacy_root = os.path.join(settings.MEDIA_ROOT, 'question_images')
+        dirs_to_try = set()
+        for q in qs:
+            if getattr(q, 'image', None) and q.image:
+                try:
+                    # Record parent directories before deleting file
+                    try:
+                        file_path = q.image.path
+                        # Walk up until reaching roots
+                        cur_dir = os.path.dirname(file_path)
+                        while cur_dir and os.path.commonpath([cur_dir, questions_root]) == questions_root and cur_dir != questions_root:
+                            dirs_to_try.add(cur_dir)
+                            cur_dir = os.path.dirname(cur_dir)
+                        cur_dir = os.path.dirname(file_path)
+                        while cur_dir and os.path.commonpath([cur_dir, legacy_root]) == legacy_root and cur_dir != legacy_root:
+                            dirs_to_try.add(cur_dir)
+                            cur_dir = os.path.dirname(cur_dir)
+                    except Exception:
+                        pass
+                    # Use the field's delete to remove the file from storage
+                    q.image.delete(save=False)
+                except Exception:
+                    pass
+    except Exception:
+        # If storage cleanup fails, proceed with DB deletion regardless
+        pass
+    course.delete()
+    # Attempt to remove empty directories collected above (deepest first)
+    try:
+        for d in sorted(dirs_to_try, key=len, reverse=True):
+            try:
+                # Remove dir if empty; ignore if not empty
+                os.rmdir(d)
+            except OSError:
+                pass
+        # Best-effort: also try course-named folder directly under roots if empty
+        candidates = set()
+        sanitized = _sanitize(str(course.course_name))
+        for root in (os.path.join(settings.MEDIA_ROOT, 'questions'), os.path.join(settings.MEDIA_ROOT, 'question_images')):
+            candidates.add(os.path.join(root, str(course.course_name)))
+            candidates.add(os.path.join(root, sanitized))
+            candidates.add(os.path.join(root, str(course.id)))
+        for cand in sorted(candidates, key=len, reverse=True):
+            try:
+                os.rmdir(cand)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return HttpResponseRedirect('/admin-view-course')
+
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_question_view(request):
+    return render(request,'exam/admin_question.html')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_add_question_view(request):
+    questionForm=forms.QuestionForm()
+    if request.method=='POST':
+        questionForm=forms.QuestionForm(request.POST, request.FILES)
+        if questionForm.is_valid():
+            question=questionForm.save(commit=False)
+            course=models.Course.objects.get(id=request.POST.get('courseID'))
+            question.course=course
+            # Ensure question.marks aligns with course setting
+            try:
+                question.marks = getattr(course, 'marks_per_question', None) or 1
+            except Exception:
+                question.marks = 1
+            question.save()
+            # Update course question_number and total_marks using course marks_per_question
+            questions = models.Question.objects.filter(course=course)
+            course.question_number = questions.count()
+            per_q = getattr(course, 'marks_per_question', None) or 1
+            course.total_marks = course.question_number * per_q
+            course.save()
+            if 'save_next' in request.POST:
+                return redirect('admin-add-question')
+            # Default: go to list of questions for this course
+            return redirect('view-question', pk=course.id)
+        else:
+            # Stay on the same page and display errors
+            return render(request,'exam/admin_add_question.html',{'questionForm':questionForm})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_add_numerical_question_view(request):
+    from .forms import NumericalQuestionForm
+    form = NumericalQuestionForm()
+    if request.method == 'POST':
+        form = NumericalQuestionForm(request.POST, request.FILES)
+        if form.is_valid():
+            q = form.save(commit=False)
+            # Course selection is required through courseID field
+            try:
+                course = models.Course.objects.get(id=int(request.POST.get('courseID')))
+            except Exception:
+                return render(request, 'exam/admin_add_numerical_question.html', {
+                    'form': form,
+                    'error': 'Please select a valid Test.'
+                })
+            q.course = course
+            # Force subject to Numericals for this page
+            q.subject = 'Numericals'
+            # Image is mandatory in this workflow
+            if not request.FILES.get('image') and not getattr(q, 'image', None):
+                form.add_error('image', 'Question image is required')
+                return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+            # Ensure marks align with course setting if not provided
+            try:
+                q.marks = int(request.POST.get('marks') or (course.marks_per_question or 1))
+            except Exception:
+                q.marks = getattr(course, 'marks_per_question', None) or 1
+
+            atype = form.cleaned_data.get('answer_type') or 'MCQ'
+            q.answer_type = atype
+            # Server-side validation per type
+            if atype == 'NUMERIC':
+                num = form.cleaned_data.get('numeric_answer')
+                if num is None or num < 0:
+                    form.add_error('numeric_answer', 'Please enter a non-negative whole number')
+                    return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+                q.numeric_answer = int(num)
+                # Clear MCQ fields to avoid confusion
+                q.correct_answer = 'A'
+                q.correct_options = None
+            elif atype == 'MULTISELECT':
+                # Require options text and at least one correct option
+                sel = form.cleaned_data.get('correct_options') or []
+                if not sel:
+                    form.add_error('correct_options', 'Select one or more correct options')
+                    return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+                # Normalize and store
+                q.correct_options = list({s.upper() for s in sel if s})
+                # Keep single-correct field aligned but not used for grading
+                if len(q.correct_options) == 1:
+                    q.correct_answer = q.correct_options[0]
+                q.numeric_answer = None
+            else:  # MCQ
+                ca = form.cleaned_data.get('correct_answer')
+                if ca not in ('A','B','C','D'):
+                    form.add_error('correct_answer', 'Please choose the correct option')
+                    return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+                q.correct_answer = ca
+                q.correct_options = [ca]
+                q.numeric_answer = None
+
+            # Ensure we have a non-empty question text since model requires it
+            if not (q.question and str(q.question).strip()):
+                import datetime, os
+                fname = ''
+                try:
+                    up = request.FILES.get('image')
+                    if up and getattr(up, 'name', None):
+                        fname = os.path.splitext(up.name)[0]
+                except Exception:
+                    pass
+                ts = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+                q.question = f"Numerical Question {ts} {fname}".strip()
+
+            q.save()
+            # Update course counters and total marks using marks_per_question
+            questions = models.Question.objects.filter(course=course)
+            course.question_number = questions.count()
+            per_q = getattr(course, 'marks_per_question', None) or 1
+            course.total_marks = course.question_number * per_q
+            course.save()
+
+            # Redirect behaviors
+            if 'save_next' in request.POST:
+                # Clear form for next entry
+                form = NumericalQuestionForm()
+                return render(request, 'exam/admin_add_numerical_question.html', {
+                    'form': form,
+                    'success': 'Question saved. You can add the next one now.'
+                })
+            return redirect('view-question', pk=course.id)
+        # invalid -> re-render with errors
+        return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+    return render(request, 'exam/admin_add_numerical_question.html', {'form': form})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_question_view(request):
+    courses= models.Course.objects.all().order_by('-id')  # Latest first
+    return render(request,'exam/admin_view_question.html',{'courses':courses})
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def view_question_view(request,pk):
+    course = models.Course.objects.get(id=pk)
+    questions=models.Question.objects.all().filter(course_id=pk)
+    return render(request,'exam/view_question.html',{'questions':questions, 'course': course})
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def delete_question_view(request,pk):
+    question=models.Question.objects.get(id=pk)
+    course = question.course
+    question.delete()
+    # Update course question_number and total_marks
+    questions = models.Question.objects.filter(course=course)
+    course.question_number = questions.count()
+    per_q = getattr(course, 'marks_per_question', None) or 1
+    course.total_marks = course.question_number * per_q
+    course.save()
+    # Stay on the same course question list page after deletion
+    return redirect('view-question', pk=course.id)
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_student_marks_view(request):
+    students= SMODEL.Student.objects.all()
+    return render(request,'exam/admin_view_student_marks.html',{'students':students})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_percentile_ranking_view(request):
+    # Build rankings per test (course) dynamically from Results
+    # Optional filters: batch (Student.batch) and student search query (first/last/username)
+    selected_batch = request.GET.get('batch') or ''
+    query = (request.GET.get('q') or '').strip()
+
+    # Determine eligible courses based on selected batch.
+    # We want to show ALL tests for the batch (even with zero results),
+    # and list them newest-first (by ID desc).
+    if selected_batch and selected_batch.lower() != 'all':
+        all_courses = list(models.Course.objects.all())
+        eligible_courses = [c for c in all_courses if selected_batch in (c.get_batches_list() if hasattr(c, 'get_batches_list') else [getattr(c, 'batch', None)])]
+    else:
+        eligible_courses = list(models.Course.objects.all())
+
+    # Order newest-first by ID
+    eligible_courses.sort(key=lambda c: c.id, reverse=True)
+
+    # Fetch all results with related objects to minimize queries and apply filters once
+    results_qs = models.Result.objects.select_related('student__user', 'exam')
+    if selected_batch and selected_batch.lower() != 'all':
+        results_qs = results_qs.filter(student__batch=selected_batch)
+    if query:
+        results_qs = results_qs.filter(
+            Q(student__user__first_name__icontains=query)
+            | Q(student__user__last_name__icontains=query)
+            | Q(student__user__username__icontains=query)
+        )
+
+    # Index results by course id for quick lookup
+    from collections import defaultdict, Counter
+    results_by_course_id = defaultdict(list)
+    for r in results_qs:
+        results_by_course_id[r.exam_id].append(r)
+
+    # Build rankings per eligible course (allowing empty results)
+    rankings_by_course = {}
+    ordered_courses = []
+    for course in eligible_courses:
+        res_list = results_by_course_id.get(course.id, [])
+        if res_list:
+            # Sort by marks desc
+            res_list.sort(key=lambda x: x.marks, reverse=True)
+            total = len(res_list)
+            # Precompute counts for percentile with ties handled (<= score)
+            freq = Counter(r.marks for r in res_list)
+            sorted_marks = sorted(freq.keys())
+            cumulative = {}
+            running = 0
+            for m in sorted_marks:
+                running += freq[m]
+                cumulative[m] = running
+            # Assign dense ranks
+            rows = []
+            last_marks = None
+            current_rank = 0
+            for r in res_list:
+                if last_marks is None or r.marks != last_marks:
+                    current_rank += 1
+                    last_marks = r.marks
+                percentile = round((cumulative[r.marks] / total) * 100, 2)
+                if current_rank == 1:
+                    percentile = 100.00
+                rows.append({
+                    'rank': current_rank,
+                    'student_name': r.student.get_name,
+                    'marks': r.marks,
+                    'percentile': percentile,
+                })
+        else:
+            # No results yet for this course
+            rows = []
+        rankings_by_course[course.id] = rows
+        ordered_courses.append(course)
+
+    # Build batch list for filter dropdown from Student model choices
+    try:
+        raw_batches = [b[0] for b in SMODEL.Student.BATCH_CHOICES]
+    except Exception:
+        # Fallback to distinct batches in DB if choices unavailable
+        raw_batches = list(
+            SMODEL.Student.objects.order_by().values_list('batch', flat=True).distinct()
+        )
+    # Ensure emergency batches appear at the bottom
+    EMERGENCY_SET = {
+        '11th Emergency 1', '11th Emergency 2', '12th Emergency 1', '12th Emergency 2'
+    }
+    normal_batches = sorted([b for b in raw_batches if b not in EMERGENCY_SET])
+    emergency_batches = [b for b in raw_batches if b in EMERGENCY_SET]
+    # Keep emergency batches in a consistent order
+    emergency_batches_sorted = sorted(emergency_batches)
+    all_batches = normal_batches + emergency_batches_sorted
+
+    context = {
+        'rankings_by_course': rankings_by_course,
+        'ordered_courses': ordered_courses,
+        'batches': all_batches,
+        'selected_batch': selected_batch or 'all',
+        'search_query': query,
+        # Provide students for fallback table when there are no rankings
+        'students': SMODEL.Student.objects.all(),
+        # Mark this as the percentile page so the template can show a specific empty-state message
+        'is_percentile_page': True,
+    }
+    return render(request, 'exam/admin_view_student_marks.html', context)
+
+
+# =============================
+# Assignments (scaffold)
+# =============================
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_assignments_home_view(request):
+    """Landing page with Create/Browse/Grade actions."""
+    return render(request, 'exam/admin_assignments_home.html')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_create_assignment_view(request):
+    """Create Assignment with batches, counts and PDF uploads."""
+    # Batch options
+    try:
+        batch_choices = [b[0] for b in SMODEL.Student.BATCH_CHOICES]
+    except Exception:
+        batch_choices = list(
+            SMODEL.Student.objects.order_by().values_list('batch', flat=True).distinct()
+        )
+
+    if request.method == 'POST':
+        errors = []
+        name = (request.POST.get('name') or '').strip()
+        selected_batches = request.POST.getlist('batches') or []
+        def _parse_int(key):
+            raw = (request.POST.get(key) or '').strip()
+            if raw == '':
+                return 0
+            try:
+                val = int(raw)
+                if val < 0:
+                    raise ValueError
+                return val
+            except Exception:
+                errors.append(f"{key.replace('_',' ').title()} must be a non-negative integer")
+                return 0
+        num_physics = _parse_int('num_physics')
+        num_chemistry = _parse_int('num_chemistry')
+        num_maths = _parse_int('num_maths')
+        num_biology = _parse_int('num_biology')
+
+        qpdf = request.FILES.get('questions_pdf')
+        apdf = request.FILES.get('answers_pdf')
+
+        # Required fields
+        if not name:
+            errors.append('Assignment Name is required')
+        if not selected_batches:
+            errors.append('Please select at least one Batch')
+        # File validations (optional but if provided, must be PDF)
+        def _is_pdf(f):
+            try:
+                ct = getattr(f, 'content_type', '') or ''
+                return (ct == 'application/pdf') or str(getattr(f, 'name', '')).lower().endswith('.pdf')
+            except Exception:
+                return False
+        if qpdf and not _is_pdf(qpdf):
+            errors.append('Questions PDF must be a PDF file')
+        if apdf and not _is_pdf(apdf):
+            errors.append('Answers PDF must be a PDF file')
+
+        if errors:
+            return render(request, 'exam/admin_create_assignment.html', {
+                'errors': errors,
+                'batch_choices': batch_choices,
+                'form_values': request.POST,
+                'selected_batches': selected_batches,
+            })
+
+        # Create unique slug from name
+        base_slug = slugify(name)[:50] or 'assignment'
+        slug_val = base_slug
+        i = 2
+        while Assignment.objects.filter(slug=slug_val).exists():
+            slug_val = f"{base_slug}-{i}"
+            i += 1
+
+        # Create instance first without files so upload_to has slug
+        assignment = Assignment(
+            name=name,
+            slug=slug_val,
+            batches_csv=','.join(selected_batches),
+            num_physics=num_physics,
+            num_chemistry=num_chemistry,
+            num_maths=num_maths,
+            num_biology=num_biology,
+            created_by=request.user if request.user.is_authenticated else None,
+        )
+        assignment.save()
+        # Attach files if provided
+        if qpdf:
+            assignment.questions_pdf = qpdf
+        if apdf:
+            assignment.answers_pdf = apdf
+        if qpdf or apdf:
+            assignment.save()
+
+        # Success panel context
+        return render(request, 'exam/admin_create_assignment.html', {
+            'success': True,
+            'assignment': assignment,
+            'batch_choices': batch_choices,
+            'preview_answers_url': f"/admin/assignments/create/?preview={assignment.id}",  # placeholder for parsing preview
+            'selected_batches': assignment.get_batches_list(),
+        })
+
+    # GET
+    return render(request, 'exam/admin_create_assignment.html', {
+        'batch_choices': batch_choices,
+        'selected_batches': [],
+        'form_values': {},
+    })
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_browse_assignments_view(request):
+    """Browse assignments with an optional single-select batch filter."""
+    selected_batch = (request.GET.get('batch') or '').strip()
+    # Build batch list from Student choices or DB distinct
+    try:
+        batch_choices = [b[0] for b in SMODEL.Student.BATCH_CHOICES]
+    except Exception:
+        batch_choices = list(
+            SMODEL.Student.objects.order_by().values_list('batch', flat=True).distinct()
+        )
+    # Query all assignments newest first
+    assignments_qs = Assignment.objects.all().order_by('-id')
+    if selected_batch:
+        assignments_qs = [a for a in assignments_qs if selected_batch in (a.get_batches_list() or [])]
+    context = {
+        'batches': batch_choices,
+        'selected_batch': selected_batch,
+        'assignments': assignments_qs,
+    }
+    return render(request, 'exam/admin_browse_assignments.html', context)
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_grade_submissions_view(request):
+    """Placeholder page for Grade Student Submissions; grading UI to follow."""
+    selected_batch = (request.GET.get('batch') or '').strip()
+    try:
+        batch_choices = [b[0] for b in SMODEL.Student.BATCH_CHOICES]
+    except Exception:
+        batch_choices = list(
+            SMODEL.Student.objects.order_by().values_list('batch', flat=True).distinct()
+        )
+    context = {
+        'batches': batch_choices,
+        'selected_batch': selected_batch,
+    }
+    return render(request, 'exam/admin_grade_submissions.html', context)
+
+
+@login_required
+@user_passes_test(is_student)
+def student_assignments_list_view(request):
+    """Student landing for assignments list, filtered by student's batch assignment."""
+    try:
+        student = SMODEL.Student.objects.select_related('user').get(user=request.user)
+        my_batch = student.batch
+    except SMODEL.Student.DoesNotExist:
+        student = None
+        my_batch = None
+    all_assignments = Assignment.objects.all().order_by('-id')
+    if my_batch:
+        assignments = [a for a in all_assignments if my_batch in (a.get_batches_list() or [])]
+    else:
+        assignments = list(all_assignments)
+    # Build attempt info for this student
+    attempts_qs = AssignmentAttempt.objects.filter(student=student, assignment__in=assignments).order_by('assignment_id', '-attempt_no') if student else []
+    attempts_by_assignment = {}
+    if attempts_qs:
+        for at in attempts_qs:
+            if at.assignment_id not in attempts_by_assignment:
+                attempts_by_assignment[at.assignment_id] = {
+                    'count': 0,
+                    'latest': at,
+                }
+            attempts_by_assignment[at.assignment_id]['count'] += 1
+    context = {
+        'assignments': assignments,
+        'attempts_by_assignment': attempts_by_assignment,
+    }
+    return render(request, 'student/assignments_list.html', context)
+
+
+@login_required
+@user_passes_test(is_student)
+def student_assignment_attempt_view(request, assignment_id: int):
+    """Attempt page shell with embedded PDF area and responses panel."""
+    try:
+        assignment = Assignment.objects.get(id=assignment_id)
+    except Assignment.DoesNotExist:
+        return redirect('student-assignments')
+    # Subject counts
+    counts = {
+        'Physics': int(getattr(assignment, 'num_physics', 0) or 0),
+        'Chemistry': int(getattr(assignment, 'num_chemistry', 0) or 0),
+        'Maths': int(getattr(assignment, 'num_maths', 0) or 0),
+        'Biology': int(getattr(assignment, 'num_biology', 0) or 0),
+    }
+    # Build simple ranges for template rendering
+    ranges = {k: list(range(1, v + 1)) for k, v in counts.items() if v > 0}
+    # Prefill strategy: latest submitted attempt responses for this student, overridden by session draft if any
+    base = {}
+    try:
+        student_obj = SMODEL.Student.objects.get(user=request.user)
+        latest_attempt = AssignmentAttempt.objects.filter(assignment=assignment, student=student_obj).order_by('-attempt_no').first()
+        if latest_attempt and latest_attempt.responses:
+            base = latest_attempt.responses
+    except SMODEL.Student.DoesNotExist:
+        base = {}
+    # Merge with draft from session (draft wins)
+    draft_only = {}
+    try:
+        prog = request.session.get('assignment_progress') or {}
+        draft_only = (prog.get(str(assignment_id)) or {}).get('responses') or {}
+    except Exception:
+        draft_only = {}
+    # Shallow merge per subject key
+    merged = {}
+    for key in ('physics','chemistry','maths','biology'):
+        merged[key] = (draft_only.get(key) if key in draft_only else base.get(key)) or []
+    import json as _json
+    draft_json = _json.dumps(merged)
+    context = {
+        'assignment': assignment,
+        'counts': counts,
+        'ranges': ranges,
+        'draft_json': draft_json,
+        'exam_mode': True,  # Hide student sidebar on attempt page
+    }
+    return render(request, 'student/assignment_attempt.html', context)
+
+
+@login_required
+@user_passes_test(is_student)
+def student_assignment_result_view(request, assignment_id: int):
+    """Show student's latest attempt result for a given assignment. Placeholder until grading is implemented."""
+    try:
+        assignment = Assignment.objects.get(id=assignment_id)
+    except Assignment.DoesNotExist:
+        return redirect('student-assignments')
+    try:
+        student = SMODEL.Student.objects.get(user=request.user)
+    except SMODEL.Student.DoesNotExist:
+        return redirect('student-assignments')
+    attempts = AssignmentAttempt.objects.filter(assignment=assignment, student=student).order_by('-attempt_no')
+    latest = attempts.first() if attempts else None
+    context = {
+        'assignment': assignment,
+        'attempts': attempts,
+        'latest': latest,
+    }
+    return render(request, 'student/assignment_result.html', context)
+
+
+# -----------------------------
+# Assignment attempt APIs & grading
+# -----------------------------
+def _normalize_responses(responses: dict, counts: dict) -> dict:
+    """Ensure each subject array exists with proper length and normalized values (A-D or None)."""
+    result = {}
+    mapping = (
+        ('physics', counts.get('Physics', 0)),
+        ('chemistry', counts.get('Chemistry', 0)),
+        ('maths', counts.get('Maths', 0)),
+        ('biology', counts.get('Biology', 0)),
+    )
+    for key, count in mapping:
+        try:
+            count = int(count or 0)
+        except Exception:
+            count = 0
+        arr = responses.get(key) or []
+        if not isinstance(arr, (list, tuple)):
+            arr = []
+        norm = []
+        for v in arr[:max(count, 0)]:
+            if v is None:
+                norm.append(None)
+            else:
+                s = str(v).strip().upper()
+                norm.append(s if s in ('A','B','C','D') else None)
+        while len(norm) < max(count, 0):
+            norm.append(None)
+        result[key] = norm
+    return result
+
+
+def _grade_responses(normalized: dict, correct: dict) -> Tuple[int, dict]:
+    """Grade by exact equality (case-insensitive), 1 mark per question."""
+    total = 0
+    breakdown = {}
+    for subj_key, subj_label in (('physics','Physics'),('chemistry','Chemistry'),('maths','Maths'),('biology','Biology')):
+        s_arr = normalized.get(subj_key) or []
+        c_arr = (correct or {}).get(subj_key) or []
+        L = min(len(s_arr), len(c_arr)) if c_arr else len(s_arr)
+        attempted = 0
+        correct_ct = 0
+        marks = 0
+        for i in range(L):
+            s = s_arr[i]
+            c = c_arr[i] if i < len(c_arr) else None
+            if s is not None:
+                attempted += 1
+            if s is not None and c is not None and str(s).upper() == str(c).upper():
+                correct_ct += 1
+                marks += 1
+        total += marks
+        breakdown[subj_label] = {
+            'attempted': attempted,
+            'correct': correct_ct,
+            'marks': marks,
+        }
+    return total, breakdown
+
+
+@require_POST
+@login_required
+@user_passes_test(is_student)
+def save_assignment_progress_api(request):
+    """Persist draft responses in session. Does not create a DB attempt."""
+    try:
+        data = json.loads(request.body or '{}')
+    except Exception:
+        return JsonResponse({'ok': False, 'error': 'Invalid JSON'}, status=400)
+    try:
+        assignment_id = int(data.get('assignment_id') or 0)
+    except Exception:
+        assignment_id = 0
+    responses = data.get('responses') or {}
+    if assignment_id <= 0:
+        return JsonResponse({'ok': False, 'error': 'Missing assignment_id'}, status=400)
+    prog = request.session.get('assignment_progress') or {}
+    from datetime import datetime
+    prog[str(assignment_id)] = {
+        'responses': responses,
+        'ts': timezone.now().isoformat(),
+    }
+    request.session['assignment_progress'] = prog
+    request.session.modified = True
+    return JsonResponse({'ok': True})
+
+
+@require_POST
+@login_required
+@user_passes_test(is_student)
+def submit_assignment_api(request):
+    """Create a new attempt, grade it, and return redirect URL to results."""
+    try:
+        data = json.loads(request.body or '{}')
+    except Exception:
+        return JsonResponse({'ok': False, 'error': 'Invalid JSON'}, status=400)
+    try:
+        assignment_id = int(data.get('assignment_id') or 0)
+    except Exception:
+        assignment_id = 0
+    responses = data.get('responses') or {}
+    if assignment_id <= 0:
+        return JsonResponse({'ok': False, 'error': 'Missing assignment_id'}, status=400)
+    # Entities
+    try:
+        assignment = Assignment.objects.get(id=assignment_id)
+    except Assignment.DoesNotExist:
+        return JsonResponse({'ok': False, 'error': 'Assignment not found'}, status=404)
+    try:
+        student = SMODEL.Student.objects.get(user=request.user)
+    except SMODEL.Student.DoesNotExist:
+        return JsonResponse({'ok': False, 'error': 'Student not found'}, status=403)
+    # If correct answers are not configured yet, we still create the attempt and grade as 0.
+    counts = {
+        'Physics': int(getattr(assignment, 'num_physics', 0) or 0),
+        'Chemistry': int(getattr(assignment, 'num_chemistry', 0) or 0),
+        'Maths': int(getattr(assignment, 'num_maths', 0) or 0),
+        'Biology': int(getattr(assignment, 'num_biology', 0) or 0),
+    }
+    normalized = _normalize_responses(responses, counts)
+    score_total, subject_breakdown = _grade_responses(normalized, assignment.correct_answers or {})
+    latest = AssignmentAttempt.objects.filter(assignment=assignment, student=student).aggregate(m=Max('attempt_no'))['m'] or 0
+    attempt = AssignmentAttempt.objects.create(
+        assignment=assignment,
+        student=student,
+        attempt_no=latest + 1,
+        responses=normalized,
+        score_total=score_total,
+        subject_breakdown=subject_breakdown,
+    )
+    # Cleanup draft
+    prog = request.session.get('assignment_progress') or {}
+    if str(assignment_id) in prog:
+        prog.pop(str(assignment_id), None)
+        request.session['assignment_progress'] = prog
+        request.session.modified = True
+    from django.urls import reverse
+    return JsonResponse({'ok': True, 'attempt_id': attempt.id, 'redirect_url': reverse('student-assignment-result', args=[assignment.id])})
+
+
+@login_required(login_url='studentlogin')
+@user_passes_test(is_student)
+def save_answer_api(request):
+    """Persist the student's current selection.
+    Supports two modes:
+      1) Index-based session save (backward compatible): fields course_id, current_q_index, selected_option, active_subject.
+      2) Direct question upsert (preferred for AJAX): fields attempt_id (course_id), question_id, selected_option (may be empty/NULL).
+
+    Behavior:
+      - Updates session answers for consistency with server-rendered progress.
+      - Upserts to StudentAnswer with transaction.atomic so the row is updated, not duplicated.
+      - Accepts idempotent retries via X-Idempotency-Key header; operation is idempotent by design.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'ok': False, 'error': 'method not allowed'}, status=405)
+    try:
+        from student.models import Student as SStudent
+        student = SStudent.objects.get(user_id=request.user.id)
+        # Inputs
+        attempt_id = request.POST.get('attempt_id') or request.POST.get('course_id')
+        question_id = request.POST.get('question_id')
+        selected_raw = request.POST.get('selected_option')
+        # Normalize selected option
+        mapping = {
+            'OptionA': 'A', 'Option A': 'A', 'A': 'A',
+            'OptionB': 'B', 'Option B': 'B', 'B': 'B',
+            'OptionC': 'C', 'Option C': 'C', 'C': 'C',
+            'OptionD': 'D', 'Option D': 'D', 'D': 'D',
+            '': None, None: None
+        }
+        selected_norm = mapping.get(selected_raw, None)
+
+        # If direct question provided, use upsert path
+        if attempt_id and question_id:
+            course = models.Course.objects.get(id=int(attempt_id))
+            question = models.Question.objects.get(id=int(question_id), course=course)
+            # Keep session answers consistent with UI
+            answers_key = f'exam_answers_ids_{course.id}_{student.id}'
+            answers = request.session.get(answers_key, {})
+            # Enhanced: handle NUMERIC and MULTISELECT
+            if getattr(question, 'answer_type', 'MCQ') == 'NUMERIC':
+                num_raw = request.POST.get('numeric_answer')
+                try:
+                    num_val = int(num_raw)
+                    if num_val < 0:
+                        raise ValueError()
+                except Exception:
+                    num_val = None
+                # Update attempted state in session map for header only
+                if num_val is None:
+                    answers.pop(str(question.id), None)
+                else:
+                    answers[str(question.id)] = f"NUM:{num_val}"
+                request.session[answers_key] = answers
+                with transaction.atomic():
+                    obj, _ = StudentAnswer.objects.select_for_update().get_or_create(
+                        student=student, exam=course, question=question,
+                        defaults={'numeric_answer': num_val}
+                    )
+                    obj.numeric_answer = num_val
+                    # Clear other fields for consistency
+                    obj.selected_option = None
+                    obj.selected_options = None
+                    obj.save(update_fields=['numeric_answer', 'selected_option', 'selected_options'])
+                return JsonResponse({'ok': True, 'mode': 'direct', 'type': 'NUMERIC'})
+            elif getattr(question, 'answer_type', 'MCQ') == 'MULTISELECT':
+                opts = request.POST.getlist('selected_options[]') or request.POST.getlist('selected_options')
+                norm = sorted({(o or '').strip().upper() for o in opts if o and (o.strip().upper() in {'A','B','C','D'})})
+                if norm:
+                    answers[str(question.id)] = 'MULTI:' + ','.join(norm)
+                else:
+                    answers.pop(str(question.id), None)
+                request.session[answers_key] = answers
+                with transaction.atomic():
+                    obj, _ = StudentAnswer.objects.select_for_update().get_or_create(
+                        student=student, exam=course, question=question,
+                        defaults={'selected_options': norm}
+                    )
+                    obj.selected_options = norm if norm else None
+                    # Clear single option field for consistency
+                    obj.selected_option = None
+                    obj.numeric_answer = None
+                    obj.save(update_fields=['selected_options', 'selected_option', 'numeric_answer'])
+                return JsonResponse({'ok': True, 'mode': 'direct', 'type': 'MULTISELECT'})
+            # Default MCQ path
+            if selected_norm is None:
+                # Remove key to reflect deselection in server-rendered counts
+                answers.pop(str(question.id), None)
+            else:
+                answers[str(question.id)] = selected_raw
+            request.session[answers_key] = answers
+            # Upsert DB row idempotently
+            with transaction.atomic():
+                obj, _created = StudentAnswer.objects.select_for_update().get_or_create(
+                    student=student, exam=course, question=question,
+                    defaults={'selected_option': selected_norm}
+                )
+                # Update even if exists to ensure idempotent overwrite
+                if obj.selected_option != selected_norm:
+                    obj.selected_option = selected_norm
+                    # Clear other fields for consistency
+                    obj.numeric_answer = None
+                    obj.selected_options = None
+                    obj.save(update_fields=['selected_option', 'numeric_answer', 'selected_options'])
+            return JsonResponse({'ok': True, 'mode': 'direct'})
+
+        # Fallback to index-based mapping (legacy behavior)
+        course_id = int(request.POST.get('course_id') or '0')
+        q_index = int(request.POST.get('current_q_index') or '0')
+        if not course_id or not q_index:
+            return JsonResponse({'ok': False, 'error': 'missing fields'}, status=400)
+        course = models.Course.objects.get(id=course_id)
+        # Prepare session answers map
+        answers_key = f'exam_answers_ids_{course.id}_{student.id}'
+        answers = request.session.get(answers_key, {})
+        # Subject context reconstruction (same as start_exam_view/calculate_marks_view)
+        SUBJECT_ORDER = ['Physics', 'Chemistry', 'Maths', 'Numericals', 'Biology']
+        present_set = set(
+            models.Question.objects
+            .filter(course=course, subject__in=SUBJECT_ORDER)
+            .values_list('subject', flat=True)
+        )
+        non_general_subjects = [s for s in SUBJECT_ORDER if s in present_set]
+        subject_mode = len(non_general_subjects) > 0
+        active_subject = request.POST.get('active_subject') or (non_general_subjects[0] if subject_mode else 'General')
+        if subject_mode and active_subject not in non_general_subjects:
+            active_subject = non_general_subjects[0]
+        base_qs = models.Question.objects.filter(course=course)
+        if subject_mode:
+            base_qs = base_qs.filter(Q(subject=active_subject) | Q(subject='General'))
+        shuffle_key = f'shuffled_questions_{course.id}_{student.id}_{active_subject if subject_mode else "all"}'
+        shuffled_ids = request.session.get(shuffle_key)
+        if not shuffled_ids:
+            shuffled_ids = list(base_qs.values_list('id', flat=True))
+        if q_index and 1 <= q_index <= len(shuffled_ids):
+            current_qid = shuffled_ids[q_index - 1]
+            question = models.Question.objects.get(id=current_qid)
+            # Handle type-specific saving similar to direct path
+            if getattr(question, 'answer_type', 'MCQ') == 'NUMERIC':
+                num_raw = request.POST.get('numeric_answer')
+                try:
+                    num_val = int(num_raw)
+                    if num_val < 0: raise ValueError()
+                except Exception:
+                    num_val = None
+                if num_val is None:
+                    answers.pop(str(question.id), None)
+                else:
+                    answers[str(question.id)] = f"NUM:{num_val}"
+                request.session[answers_key] = answers
+                with transaction.atomic():
+                    obj, _ = StudentAnswer.objects.select_for_update().get_or_create(
+                        student=student, exam=course, question=question,
+                        defaults={'numeric_answer': num_val}
+                    )
+                    obj.numeric_answer = num_val
+                    obj.selected_option = None
+                    obj.selected_options = None
+                    obj.save(update_fields=['numeric_answer','selected_option','selected_options'])
+                return JsonResponse({'ok': True, 'mode': 'index', 'type': 'NUMERIC'})
+            elif getattr(question, 'answer_type', 'MCQ') == 'MULTISELECT':
+                opts = request.POST.getlist('selected_options[]') or request.POST.getlist('selected_options')
+                norm = sorted({(o or '').strip().upper() for o in opts if o and (o.strip().upper() in {'A','B','C','D'})})
+                if norm:
+                    answers[str(question.id)] = 'MULTI:' + ','.join(norm)
+                else:
+                    answers.pop(str(question.id), None)
+                request.session[answers_key] = answers
+                with transaction.atomic():
+                    obj, _ = StudentAnswer.objects.select_for_update().get_or_create(
+                        student=student, exam=course, question=question,
+                        defaults={'selected_options': norm}
+                    )
+                    obj.selected_options = norm if norm else None
+                    obj.selected_option = None
+                    obj.numeric_answer = None
+                    obj.save(update_fields=['selected_options','selected_option','numeric_answer'])
+                return JsonResponse({'ok': True, 'mode': 'index', 'type': 'MULTISELECT'})
+            # Default MCQ
+            if selected_raw:
+                answers[str(current_qid)] = selected_raw
+            else:
+                answers.pop(str(current_qid), None)
+            request.session[answers_key] = answers
+            with transaction.atomic():
+                obj, _created = StudentAnswer.objects.select_for_update().get_or_create(
+                    student=student, exam=course, question=question,
+                    defaults={'selected_option': selected_norm}
+                )
+                if obj.selected_option != selected_norm:
+                    obj.selected_option = selected_norm
+                    obj.numeric_answer = None
+                    obj.selected_options = None
+                    obj.save(update_fields=['selected_option','numeric_answer','selected_options'])
+            return JsonResponse({'ok': True, 'mode': 'index'})
+        # If index was invalid, treat as no-op
+        return JsonResponse({'ok': False, 'error': 'index out of range'}, status=400)
+    except Exception as e:
+        return JsonResponse({'ok': False, 'error': str(e)}, status=500)
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_view_marks_view(request,pk):
+    courses = models.Course.objects.all().order_by('-id')  # Latest first
+    student = SMODEL.Student.objects.get(id=pk)
+    
+    # Get marks for each course for this student
+    courses_with_marks = []
+    for course in courses:
+        try:
+            result = models.Result.objects.get(student=student, exam=course)
+            marks_obtained = result.marks
+        except models.Result.DoesNotExist:
+            marks_obtained = "Not Attempted"
+        
+        courses_with_marks.append({
+            'course': course,
+            'marks_obtained': marks_obtained
+        })
+    
+    response = render(request,'exam/admin_view_marks.html',{
+        'courses_with_marks': courses_with_marks,
+        'student': student
+    })
+    response.set_cookie('student_id',str(pk))
+    return response
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_check_marks_view(request,pk):
+    course = models.Course.objects.get(id=pk)
+    student_id = request.COOKIES.get('student_id')
+    if not student_id:
+        return render(request, 'exam/admin_check_marks.html', {
+            'error': 'No student selected. Please use the admin interface to select a student.'
+        })
+    try:
+        student = SMODEL.Student.objects.get(id=student_id)
+    except SMODEL.Student.DoesNotExist:
+        return render(request, 'exam/admin_check_marks.html', {
+            'error': 'Student not found. Please check your selection.'
+        })
+    results= models.Result.objects.all().filter(exam=course).filter(student=student)
+    # Full question set for this exam
+    questions = models.Question.objects.filter(course=course).select_related('course').order_by('question_number', 'id')
+    # Total possible marks similar to student view, based on course marks_per_question
+    per_q = getattr(course, 'marks_per_question', None) or 1
+    total_possible_marks = len(questions) * per_q
+    answers = StudentAnswer.objects.filter(student=student, exam=course).select_related('question')
+    answers_by_qid = {a.question_id: a for a in answers}
+    # Overall attempted: MCQ, Numeric, or Multiselect
+    overall_attempted = 0
+    for a in answers:
+        if a.selected_option:
+            overall_attempted += 1
+        elif a.numeric_answer is not None:
+            overall_attempted += 1
+        elif a.selected_options:
+            try:
+                if len(a.selected_options) > 0:
+                    overall_attempted += 1
+            except Exception:
+                pass
+    # New: Build a mapping of question.id -> time_taken (in seconds)
+    qtl_by_qid = {}
+    for q in questions:
+        try:
+            qtl = QuestionTimeLog.objects.get(student=student, question=q)
+            if qtl.time_spent:
+                qtl_by_qid[q.id] = int(qtl.time_spent.total_seconds())
+            else:
+                qtl_by_qid[q.id] = "-"
+        except QuestionTimeLog.DoesNotExist:
+            qtl_by_qid[q.id] = "-"
+    # Subject-wise breakdown similar to student check-marks
+    SUBJECT_ORDER = ['Physics', 'Chemistry', 'Maths', 'Numericals', 'Biology']
+    present_subjects = list(models.Question.objects.filter(course=course).values_list('subject', flat=True).distinct())
+    non_general = [s for s in present_subjects if s and s != 'General']
+    ordered_subjects = [s for s in SUBJECT_ORDER if s in non_general]
+    subject_stats = []
+    if ordered_subjects:
+        for subj in ordered_subjects:
+            subj_questions = [q for q in questions if q.subject == subj]
+            correct = 0
+            incorrect = 0
+            subj_marks = 0
+            for q in subj_questions:
+                ans = answers_by_qid.get(q.id)
+                atype = getattr(q, 'answer_type', 'MCQ')
+                if atype == 'NUMERIC':
+                    if ans and ans.numeric_answer is not None:
+                        if (q.numeric_answer is not None) and int(ans.numeric_answer) == int(q.numeric_answer):
+                            correct += 1
+                            subj_marks += per_q
+                        else:
+                            incorrect += 1
+                elif atype == 'MULTISELECT':
+                    sel = sorted(set((ans.selected_options or []))) if ans and ans.selected_options else []
+                    corr = sorted(set((q.correct_options or []))) if q.correct_options else []
+                    if sel:
+                        if sel == corr:
+                            correct += 1
+                            subj_marks += per_q
+                        else:
+                            incorrect += 1
+                else:
+                    selected_letter = ans.selected_option if ans else None
+                    if selected_letter == q.correct_answer:
+                        correct += 1
+                        subj_marks += per_q
+                    elif selected_letter is not None and selected_letter != q.correct_answer:
+                        incorrect += 1
+            if hasattr(course, 'negative_mark') and course.negative_mark:
+                subj_marks = max(0, subj_marks - incorrect * 1)
+            subject_stats.append({
+                'subject': subj,
+                'total': len(subj_questions),
+                'attempted': (correct + incorrect),
+                'correct': correct,
+                'incorrect': incorrect,
+                'marks': subj_marks,
+            })
+    # Build questions grouped by subject for sectioned display like student view
+    questions_by_subject = {}
+    for subj in (ordered_subjects or []):
+        qs = [q for q in questions if q.subject == subj]
+        qs.sort(key=lambda q: (q.question_number or 0, q.id))
+        questions_by_subject[subj] = qs
+
+    return render(request,'exam/admin_check_marks.html',{
+        'results': results,
+        'questions': questions,
+        'all_questions': questions,
+        'questions_by_subject': questions_by_subject,
+        'total_possible_marks': total_possible_marks,
+        'answers_by_qid': answers_by_qid,
+        'student': student,
+        'course': course,
+        'qtl_by_qid': qtl_by_qid,
+        'subject_stats': subject_stats,
+        'overall_attempted': overall_attempted,
+    })
+    
+
+
+
+
+def aboutus_view(request):
+    return render(request,'exam/aboutus.html')
+
+def logout_view(request):
+    """Log out the user on GET or POST and redirect to home."""
+    try:
+        logout(request)
+    except Exception:
+        # Ignore any logout edge-case errors and still redirect
+        pass
+    return redirect('/')
+
+def contactus_view(request):
+    sub = forms.ContactusForm()
+    if request.method == 'POST':
+        sub = forms.ContactusForm(request.POST)
+        if sub.is_valid():
+            email = sub.cleaned_data['Email']
+            name=sub.cleaned_data['Name']
+            message = sub.cleaned_data['Message']
+            send_mail(str(name)+' || '+str(email),message,settings.EMAIL_HOST_USER, settings.EMAIL_RECEIVING_USER, fail_silently = False)
+            return render(request, 'exam/contactussuccess.html')
+    return render(request, 'exam/contactus.html', {'form':sub})
+
+
+@login_required(login_url='studentlogin')
+def question_statuses_api(request, attempt_id: int):
+    """Return JSON of question statuses grouped by subject sections for the current student.
+
+    attempt_id here is the course (exam) id. We compute per-section ordered lists
+    based on the same shuffled order used in start_exam_view, and mark questions
+    as attempted/unattempted using StudentAnswer. The client may pass
+    optional current_qid via GET to flag the current tile.
+    """
+    from student.models import Student as SStudent
+    try:
+        student = SStudent.objects.get(user_id=request.user.id)
+    except SStudent.DoesNotExist:
+        return JsonResponse({'error': 'student profile not found'}, status=403)
+    try:
+        course = models.Course.objects.get(id=attempt_id)
+    except models.Course.DoesNotExist:
+        return JsonResponse({'error': 'course not found'}, status=404)
+
+    # Build sections (exclude 'General' to avoid duplication)
+    SUBJECT_ORDER = ['Physics', 'Chemistry', 'Maths', 'Numericals', 'Biology']
+    present = set(models.Question.objects.filter(course=course, subject__in=SUBJECT_ORDER).values_list('subject', flat=True))
+    sections = [s for s in SUBJECT_ORDER if s in present]
+
+    # Preload answers for attempted status (any type)
+    ans_qs = models.StudentAnswer.objects.filter(student=student, exam=course)
+    ans_qids = set()
+    for a in ans_qs.only('question_id', 'selected_option', 'numeric_answer', 'selected_options'):
+        if a.selected_option:
+            ans_qids.add(a.question_id)
+        elif a.numeric_answer is not None:
+            ans_qids.add(a.question_id)
+        elif a.selected_options:
+            try:
+                if len(a.selected_options) > 0:
+                    ans_qids.add(a.question_id)
+            except Exception:
+                pass
+
+    # Optional current question id to highlight
+    try:
+        cur_qid = int(request.GET.get('current_qid')) if request.GET.get('current_qid') else None
+    except ValueError:
+        cur_qid = None
+
+    data_sections = []
+    for subj in sections:
+        # Reconstruct the shuffled order used in start_exam_view for this subject context
+        shuffle_key = f"shuffled_questions_{course.id}_{student.id}_{subj}"
+        shuffled_ids = request.session.get(shuffle_key)
+        if not shuffled_ids:
+            # Fallback to deterministic order within this subject INCLUDING 'General' to mirror start_exam_view
+            base_qs = models.Question.objects.filter(course=course).filter(Q(subject=subj) | Q(subject='General'))
+            shuffled_ids = list(base_qs.values_list('id', flat=True))
+        # Build questions list for the chart with per-subject index (1-based)
+        q_items = []
+        for idx, qid in enumerate(shuffled_ids, start=1):
+            q_items.append({
+                'id': qid,
+                'number': idx,
+                'status': 'attempted' if qid in ans_qids else 'unattempted',
+                'is_current': True if (cur_qid and qid == cur_qid) else False,
+            })
+        data_sections.append({'name': subj, 'questions': q_items, 'count': len(q_items)})
+
+    return JsonResponse({'sections': data_sections})
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def activate_course_view(request, pk):
+    if request.method == 'POST':
+        course = models.Course.objects.get(id=pk)
+        course.status = 'active'
+        # Set global activation timestamp so duration starts for everyone now
+        if not getattr(course, 'activated_at', None):
+            course.activated_at = timezone.now()
+        # Update question_number and total_marks
+        questions = models.Question.objects.filter(course=course)
+        course.question_number = questions.count()
+        per_q = getattr(course, 'marks_per_question', None) or 1
+        course.total_marks = course.question_number * per_q
+        course.save()
+    return redirect('admin-view-course')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def reactivate_course_view(request, pk):
+    """Display page for selective student test reactivation"""
+    from django.contrib import messages
+    
+    course = models.Course.objects.get(id=pk)
+    
+    # Get all students from the course batches (supports multi-batch via Course.get_batches_list)
+    try:
+        batch_list = course.get_batches_list() if hasattr(course, 'get_batches_list') else ([course.batch] if getattr(course, 'batch', None) else [])
+    except Exception:
+        batch_list = [course.batch] if getattr(course, 'batch', None) else []
+    students_in_batch = SMODEL.Student.objects.filter(batch__in=batch_list)
+    
+    # Prepare student data with submission status
+    students_data = []
+    for student in students_in_batch:
+        # Check if student has submitted this test
+        try:
+            result = models.Result.objects.get(student=student, exam=course)
+            has_submitted = True
+            marks = result.marks
+        except models.Result.DoesNotExist:
+            has_submitted = False
+            marks = 0
+        
+        students_data.append({
+            'student': student,
+            'has_submitted': has_submitted,
+            'marks': marks
+        })
+    
+    if request.method == 'POST':
+        selected_student_ids = request.POST.getlist('selected_students')
+        
+        if not selected_student_ids:
+            messages.error(request, 'Please select at least one student to reactivate the test.')
+            return render(request, 'exam/admin_reactivate_test.html', {
+                'course': course,
+                'students': students_data
+            })
+        
+        # Reset test for selected students only
+        reset_count = 0
+        for student_id in selected_student_ids:
+            try:
+                student = SMODEL.Student.objects.get(id=student_id)
+                
+                # Delete previous results
+                models.Result.objects.filter(student=student, exam=course).delete()
+                
+                # Delete previous answers
+                models.StudentAnswer.objects.filter(student=student, exam=course).delete()
+                
+                # Delete time logs
+                questions = models.Question.objects.filter(course=course)
+                models.QuestionTimeLog.objects.filter(
+                    student=student, 
+                    question__in=questions
+                ).delete()
+                
+                reset_count += 1
+                
+            except SMODEL.Student.DoesNotExist:
+                continue
+        
+        # Reactivate the course with fresh timestamp
+        course.status = 'active'
+        course.activated_at = timezone.now()
+        course.save()
+        
+        messages.success(request, f'Test successfully reactivated for {reset_count} selected student(s). They can now take the test again with fresh duration.')
+        return redirect('admin-view-course')
+    
+    return render(request, 'exam/admin_reactivate_test.html', {
+        'course': course,
+        'students': students_data
+    })
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def admin_upload_questions_pdf_view(request):
+    """Two-step PDF processing: Questions PDF first, then Answers PDF"""
+    from .pdf_processor import process_exam_pdfs
+    from django.contrib import messages
+    from django.core.files.storage import default_storage
+    
+    courses = models.Course.objects.all().order_by('-id')  # Latest first
+    
+    # Clear any existing messages on GET request (fresh page load)
+    if request.method == 'GET':
+        # Clear all messages from previous sessions
+        storage = messages.get_messages(request)
+        for _ in storage:
+            pass  # Consume all messages to clear them
+    
+    if request.method == 'POST':
+        course_id = request.POST.get('course')
+        questions_pdf = request.FILES.get('questions_pdf')
+        answers_pdf = request.FILES.get('answers_pdf')
+        clear_existing = request.POST.get('clear_existing') == 'on'
+        
+        if not course_id:
+            messages.error(request, 'Please select a course')
+            return render(request, 'exam/upload_pdf_two_step.html', {'courses': courses})
+            
+        if not questions_pdf or not answers_pdf:
+            messages.error(request, 'Both Questions PDF and Answers PDF are required')
+            return render(request, 'exam/upload_pdf_two_step.html', {'courses': courses})
+        
+        try:
+            course = models.Course.objects.get(id=course_id)
+
+            # Save uploaded files temporarily (default_storage may be FileSystemStorage)
+            questions_path = default_storage.save(f'temp/questions_{course_id}.pdf', questions_pdf)
+            answers_path = default_storage.save(f'temp/answers_{course_id}.pdf', answers_pdf)
+
+            # Robustly obtain absolute filesystem path (works with FileSystemStorage)
+            def get_full_path(storage, rel_path):
+                if hasattr(storage, 'path'):
+                    try:
+                        return storage.path(rel_path)
+                    except Exception:
+                        pass
+                # Fallback to MEDIA_ROOT join (works for default local storage)
+                return os.path.join(settings.MEDIA_ROOT, rel_path)
+
+            questions_full_path = get_full_path(default_storage, questions_path)
+            answers_full_path = get_full_path(default_storage, answers_path)
+
+            # Clear existing questions if requested
+            if clear_existing:
+                existing_count = course.question_set.count()
+                course.question_set.all().delete()
+                messages.info(request, f'Deleted {existing_count} existing questions')
+
+            # Optional overwrite flag (if you add checkbox to the form)
+            overwrite_existing = request.POST.get('overwrite_existing') == 'on'
+
+            # Optional manual expected_questions override from form (recommended)
+            expected_override = request.POST.get('expected_questions')
+            try:
+                expected_override = int(expected_override) if expected_override not in (None, '') else None
+            except ValueError:
+                expected_override = None
+
+            # Derive expected_questions in a safe order: form override -> course.total_questions -> course.question_number -> current DB count
+            expected_questions = None
+            if expected_override:
+                expected_questions = expected_override
+            else:
+                for attr in ('total_questions', 'question_number'):
+                    v = getattr(course, attr, None)
+                    if isinstance(v, int) and v > 0:
+                        expected_questions = v
+                        break
+                if not expected_questions:
+                    cnt = course.question_set.count()
+                    if cnt > 0:
+                        expected_questions = cnt
+
+            # Validate expected_questions (processor expects a positive integer for completeness checks)
+            if not isinstance(expected_questions, int) or expected_questions <= 0:
+                # Clean up temp files
+                try:
+                    default_storage.delete(questions_path)
+                    default_storage.delete(answers_path)
+                except Exception:
+                    pass
+                messages.error(
+                    request,
+                    f'Course must have a valid total_questions value or you must provide an Expected Questions number. '
+                    f'Currently: {expected_questions}'
+                )
+                return render(request, 'exam/upload_pdf_two_step.html', {'courses': courses})
+
+            # Call the processor with named args (prevents wrong positional passing)
+            results = process_exam_pdfs(
+                questions_full_path,
+                answers_full_path,
+                expected_questions=expected_questions,
+                course=course,
+                overwrite=overwrite_existing
+            )
+
+            # Normalize results so template doesn't see empty values
+            questions_created = results.get('questions_created', results.get('created', 0))
+            questions_updated = results.get('questions_updated', results.get('updated', 0))
+            answers_updated = results.get('answers_updated', results.get('answers_updated', 0))
+            skipped_questions = results.get('skipped_questions', []) or results.get('pipeline_report', {}).get('skipped_questions', [])
+
+            # Update course question_number (created + updated) if pipeline succeeded
+            if results.get('success', False):
+                course.question_number = questions_created + questions_updated
+                course.save()
+
+            # Push friendly messages and pipeline warnings/errors
+            if results.get('success', False):
+                messages.success(
+                    request,
+                    f'Processing completed successfully! Created {questions_created} questions, '
+                    f'updated {questions_updated} questions, applied {answers_updated} answers.'
+                )
+
+                # show pipeline-level warnings
+                pipeline_report = results.get('pipeline_report', {}) or {}
+                for warning in pipeline_report.get('warnings', []):
+                    messages.warning(request, f'Warning: {warning}')
+
+                # show missing / skipped questions to the admin
+                missing = pipeline_report.get('missing_questions', []) or []
+                if missing:
+                    messages.info(request, f'Missing questions in answers PDF: {", ".join(map(str, missing))}')
+                if skipped_questions:
+                    messages.info(request, f'Skipped questions while cropping: {", ".join(map(str, skipped_questions))}')
+
+            else:
+                # failure path: display errors from pipeline_report if present
+                messages.error(request, f'Error during processing: {results.get("error", "Unknown error")}')
+                pipeline_report = results.get('pipeline_report', {}) or {}
+                for err in pipeline_report.get('errors', []):
+                    messages.error(request, f'Pipeline error: {err}')
+
+            # Finally render the result page with the full results dict (so template can access everything)
+            return render(request, 'exam/upload_result_two_step.html', {
+                'results': results,
+                'course': course,
+            })
+
+        finally:
+            # Ensure temp uploads are cleaned up in all cases (best-effort)
+            try:
+                default_storage.delete(questions_path)
+                default_storage.delete(answers_path)
+            except Exception:
+                pass
+
+            except models.Course.DoesNotExist:
+                messages.error(request, f'Course with ID {course_id} does not exist')
+            except Exception as e:
+                # Catch-all: ensure temporary files removed and message shown
+                try:
+                    default_storage.delete(questions_path)
+                    default_storage.delete(answers_path)
+                except Exception:
+                    pass
+                messages.error(request, f'Error processing PDFs: {str(e)}')
+    
+    return render(request, 'exam/upload_pdf_two_step.html', {'courses': courses})
+
+
+@login_required(login_url='adminlogin')
+def admin_upload_subjectwise_view(request):
+    """Subject-wise upload: 4 subjects x (Questions, Answers). Allows partial subjects with pair validation."""
+    from .pdf_processor import process_exam_pdfs
+    from django.contrib import messages
+    from django.core.files.storage import default_storage
+
+    SUBJECTS = ['Physics', 'Chemistry', 'Maths', 'Biology', 'Mix']
+    courses = models.Course.objects.all().order_by('-id')  # Latest first
+
+    if request.method == 'POST':
+        course_id = request.POST.get('course')
+        if not course_id:
+            messages.error(request, 'Please select a course')
+            return render(request, 'exam/upload_pdf_subjectwise.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        try:
+            course = models.Course.objects.get(id=course_id)
+        except models.Course.DoesNotExist:
+            messages.error(request, 'Invalid course')
+            return render(request, 'exam/upload_pdf_subjectwise.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        # Options
+        overwrite_existing = request.POST.get('overwrite_existing') == 'on'
+        expected_override = request.POST.get('expected_questions')
+        try:
+            expected_override = int(expected_override) if expected_override not in (None, '') else None
+        except ValueError:
+            expected_override = None
+
+        per_subject_results = {}
+        any_uploaded = False
+
+        for subj in SUBJECTS:
+            q_file = request.FILES.get(f'{subj.lower()}_questions')
+            a_file = request.FILES.get(f'{subj.lower()}_answers')
+
+            # Skip subject if no files provided
+            if not q_file and not a_file:
+                continue
+
+            any_uploaded = True
+
+            # Pair validation
+            if (q_file and not a_file) or (a_file and not q_file):
+                per_subject_results[subj] = {
+                    'success': False,
+                    'error': 'Both Questions and Answers PDFs are required for this subject'
+                }
+                continue
+
+            # Save temp files
+            questions_path = default_storage.save(f'temp/{subj}_questions_{course_id}.pdf', q_file)
+            answers_path = default_storage.save(f'temp/{subj}_answers_{course_id}.pdf', a_file)
+
+            def get_full_path(storage, rel_path):
+                if hasattr(storage, 'path'):
+                    try:
+                        return storage.path(rel_path)
+                    except Exception:
+                        pass
+                return os.path.join(settings.MEDIA_ROOT, rel_path)
+
+            q_full = get_full_path(default_storage, questions_path)
+            a_full = get_full_path(default_storage, answers_path)
+
+            # Derive expected_questions per subject
+            expected_questions = expected_override
+            if not expected_questions:
+                v = getattr(course, 'total_questions', None)
+                if isinstance(v, int) and v > 0:
+                    expected_questions = v
+            if not expected_questions:
+                expected_questions = None
+
+            # Run per-subject in its own transaction and try/finally for cleanup
+            try:
+                result = process_exam_pdfs(
+                    q_full,
+                    a_full,
+                    expected_questions=expected_questions if expected_questions else 1,
+                    course=course,
+                    overwrite=overwrite_existing,
+                    subject=('General' if subj == 'Mix' else subj)
+                )
+                per_subject_results[subj] = result
+            except Exception as e:
+                per_subject_results[subj] = {'success': False, 'error': str(e)}
+            finally:
+                try:
+                    default_storage.delete(questions_path)
+                    default_storage.delete(answers_path)
+                except Exception:
+                    pass
+
+        if not any_uploaded:
+            messages.error(request, 'Please upload at least one subject pair or use the legacy mixed-PDF mode.')
+            return render(request, 'exam/upload_pdf_subjectwise.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        # Aggregate messages
+        for subj, res in per_subject_results.items():
+            if res.get('success'):
+                messages.success(request, f"{subj}: Created {res.get('questions_created',0)}, Updated {res.get('questions_updated',0)}, Answers {res.get('answers_updated',0)}")
+            else:
+                messages.error(request, f"{subj}: {res.get('error','Failed to process')}")
+
+        return render(request, 'exam/upload_result_subjectwise.html', {
+            'results_by_subject': per_subject_results,
+            'course': course,
+        })
+
+    return render(request, 'exam/upload_pdf_subjectwise.html', {'courses': courses, 'subjects': SUBJECTS})
+
+
+@login_required(login_url='adminlogin')
+def admin_upload_subjectwise_format2_view(request):
+    """Subject-wise upload UI for Format 2 processing. Identical UI, separate route to avoid mixing formats."""
+    from .pdf_processor import process_exam_pdfs_format2
+    from django.contrib import messages
+    from django.core.files.storage import default_storage
+
+    SUBJECTS = ['Physics', 'Chemistry', 'Maths', 'Biology', 'Mix']
+    courses = models.Course.objects.all().order_by('-id')  # Latest first
+
+    if request.method == 'POST':
+        course_id = request.POST.get('course')
+        if not course_id:
+            messages.error(request, 'Please select a course')
+            return render(request, 'exam/upload_pdf_subjectwise_format2.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        try:
+            course = models.Course.objects.get(id=course_id)
+        except models.Course.DoesNotExist:
+            messages.error(request, 'Invalid course')
+            return render(request, 'exam/upload_pdf_subjectwise_format2.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        overwrite_existing = request.POST.get('overwrite_existing') == 'on'
+        expected_override = request.POST.get('expected_questions')
+        try:
+            expected_override = int(expected_override) if expected_override not in (None, '') else None
+        except ValueError:
+            expected_override = None
+
+        per_subject_results = {}
+        any_uploaded = False
+
+        for subj in SUBJECTS:
+            q_file = request.FILES.get(f'{subj.lower()}_questions')
+            a_file = request.FILES.get(f'{subj.lower()}_answers')
+
+            if not q_file and not a_file:
+                continue
+
+            any_uploaded = True
+
+            if (q_file and not a_file) or (a_file and not q_file):
+                per_subject_results[subj] = {
+                    'success': False,
+                    'error': 'Both Questions and Answers PDFs are required for this subject'
+                }
+                continue
+
+            questions_path = default_storage.save(f'temp/{subj}_questions_{course_id}.pdf', q_file)
+            answers_path = default_storage.save(f'temp/{subj}_answers_{course_id}.pdf', a_file)
+
+            def get_full_path(storage, rel_path):
+                if hasattr(storage, 'path'):
+                    try:
+                        return storage.path(rel_path)
+                    except Exception:
+                        pass
+                return os.path.join(settings.MEDIA_ROOT, rel_path)
+
+            q_full = get_full_path(default_storage, questions_path)
+            a_full = get_full_path(default_storage, answers_path)
+
+            expected_questions = expected_override
+            if not expected_questions:
+                v = getattr(course, 'total_questions', None)
+                if isinstance(v, int) and v > 0:
+                    expected_questions = v
+            if not expected_questions:
+                expected_questions = None
+
+            try:
+                result = process_exam_pdfs_format2(
+                    q_full,
+                    a_full,
+                    expected_questions=expected_questions if expected_questions else 1,
+                    course=course,
+                    overwrite=overwrite_existing,
+                    subject=('General' if subj == 'Mix' else subj)
+                )
+                per_subject_results[subj] = result
+            except Exception as e:
+                per_subject_results[subj] = {'success': False, 'error': str(e)}
+            finally:
+                try:
+                    default_storage.delete(questions_path)
+                    default_storage.delete(answers_path)
+                except Exception:
+                    pass
+
+        if not any_uploaded:
+            messages.error(request, 'Please upload at least one subject pair for Format 2.')
+            return render(request, 'exam/upload_pdf_subjectwise_format2.html', {'courses': courses, 'subjects': SUBJECTS})
+
+        for subj, res in per_subject_results.items():
+            if res.get('success'):
+                messages.success(request, f"{subj} (Format 2): Created {res.get('questions_created',0)}, Updated {res.get('questions_updated',0)}, Answers {res.get('answers_updated',0)}")
+            else:
+                messages.error(request, f"{subj} (Format 2): {res.get('error','Failed to process')}")
+
+        return render(request, 'exam/upload_result_subjectwise.html', {
+            'results_by_subject': per_subject_results,
+            'course': course,
+        })
+
+    return render(request, 'exam/upload_pdf_subjectwise_format2.html', {'courses': courses, 'subjects': SUBJECTS})
+
+
+
+@csrf_exempt
+def exam_log_view(request):
+    if request.method == 'POST':
+        import json
+        try:
+            data = json.loads(request.body.decode())
+            print('[ExamTimingLog]', data.get('msg', ''))
+        except Exception as e:
+            print('[ExamTimingLog] Error:', e)
+        return JsonResponse({'status': 'ok'})
+    return JsonResponse({'status': 'invalid'}, status=400)
+
+
+@csrf_exempt
+@login_required(login_url='studentlogin')
+def question_time_log_view(request):
+    if request.method == 'POST':
+        try:
+            import json
+            data = json.loads(request.body.decode())
+            question_id = data.get('question_id')
+            event_type = data.get('event_type')
+            if not question_id or event_type not in ['enter', 'exit']:
+                return JsonResponse({'status': 'error', 'msg': 'Invalid data'}, status=400)
+            from student.models import Student
+            student = Student.objects.get(user_id=request.user.id)
+            from .models import Question, QuestionTimeLog
+            question = Question.objects.get(id=question_id)
+            now = timezone.now()
+            if event_type == 'enter':
+                # Create if missing; otherwise reset start_time for a new timing segment
+                try:
+                    log = QuestionTimeLog.objects.get(student=student, question=question)
+                    log.start_time = now
+                    # Do not change end_time here; it marks previous segment end
+                    log.save(update_fields=['start_time'])
+                except QuestionTimeLog.DoesNotExist:
+                    QuestionTimeLog.objects.create(student=student, question=question, start_time=now)
+            elif event_type == 'exit':
+                try:
+                    log = QuestionTimeLog.objects.get(student=student, question=question)
+                    log.end_time = now
+                    # Save computes and accumulates time_spent
+                    log.save()
+                except QuestionTimeLog.DoesNotExist:
+                    # Fallback: create with both times if somehow missing
+                    QuestionTimeLog.objects.create(student=student, question=question, start_time=now, end_time=now)
+            return JsonResponse({'status': 'ok'})
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'msg': str(e)}, status=500)
+    return JsonResponse({'status': 'invalid'}, status=400)
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def crop_question_view(request, question_id):
+    """Display the crop interface for a specific question image"""
+    from .models import Question
+    from django.contrib import messages
+    from django.shortcuts import render, redirect
+    try:
+        question = Question.objects.get(id=question_id)
+        if not question.image:
+            messages.error(request, 'This question does not have an image to crop.')
+            return redirect('view-question', pk=question.course.id)
+        return render(request, 'exam/crop_question.html', {'question': question})
+    except Question.DoesNotExist:
+        messages.error(request, 'Question not found.')
+        return redirect('admin-view-question')
+
+
+@login_required(login_url='adminlogin')
+@user_passes_test(is_admin)
+def crop_question_image(request, question_id):
+    """Handle the actual image cropping operation"""
+    if request.method != 'POST':
+        return JsonResponse({'success': False, 'error': 'Invalid request method'})
+    
+    from .models import Question
+    from PIL import Image
+    import json
+    import os
+    from django.core.files.base import ContentFile
+    from django.core.files.storage import default_storage
+    import io
+    
+    try:
+        question = Question.objects.get(id=question_id)
+        if not question.image:
+            return JsonResponse({'success': False, 'error': 'Question has no image'})
+        
+        # Parse crop data from request
+        crop_data = json.loads(request.body)
+        x = int(crop_data.get('x', 0))
+        y = int(crop_data.get('y', 0))
+        width = int(crop_data.get('width', 100))
+        height = int(crop_data.get('height', 100))
+        
+        # Validate crop dimensions
+        if width < 10 or height < 10:
+            return JsonResponse({'success': False, 'error': 'Crop area too small'})
+        
+        # Open the original image
+        image_path = question.image.path
+        with Image.open(image_path) as img:
+            # Validate crop coordinates
+            if x < 0 or y < 0 or x + width > img.width or y + height > img.height:
+                return JsonResponse({'success': False, 'error': 'Crop area exceeds image boundaries'})
+            
+            # Perform the crop
+            cropped_img = img.crop((x, y, x + width, y + height))
+            
+            # Save the cropped image
+            img_format = img.format or 'JPEG'
+            output = io.BytesIO()
+            cropped_img.save(output, format=img_format, quality=95)
+            output.seek(0)
+            
+            # Generate new filename
+            original_name = os.path.basename(question.image.name)
+            name_parts = os.path.splitext(original_name)
+            new_name = f"{name_parts[0]}_cropped{name_parts[1]}"
+            
+            # Save the new image
+            question.image.save(
+                new_name,
+                ContentFile(output.getvalue()),
+                save=True
+            )
+        
+        return JsonResponse({'success': True, 'message': 'Image cropped successfully'})
+        
+    except Question.DoesNotExist:
+        return JsonResponse({'success': False, 'error': 'Question not found'})
+    except Exception as e:
+        return JsonResponse({'success': False, 'error': f'Error cropping image: {str(e)}'})
+
