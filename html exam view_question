@@ -1,0 +1,213 @@
+{% extends 'exam/adminbase.html' %}
+{% block content %}
+{%load static%}
+
+<head>
+  <style>
+    .table-header {
+      font-size: 2rem;
+      font-weight: 600;
+      color: #0288d1;
+      margin: 2rem 0 1.5rem 0;
+      text-align: center;
+    }
+    .table-container {
+      background: #fff;
+      border-radius: 1rem;
+      box-shadow: 0 2px 16px #0001;
+      padding: 2rem 1.5rem;
+      border: none;
+    }
+    .table { table-layout: fixed; width: 100%; }
+    /* Ensure consistent top alignment and column-specific alignment */
+    .table th, .table td {
+      vertical-align: top !important;
+    }
+    .table thead th { text-align: center; }
+    .col-sr { width: 8%; text-align: center; }
+    .col-question { width: 48%; text-align: left; }
+    .col-answer { width: 18%; text-align: center; }
+    .col-marks { width: 10%; text-align: center; }
+    .col-action { width: 16%; text-align: center; }
+    .btn-danger { background: #ef5350; border: none; border-radius: 0.5rem; }
+    .btn-danger:hover { background: #b71c1c; }
+    @media (max-width: 600px) {
+      .table-container { padding: 1rem 0.5rem; }
+    }
+    .subject-section-title {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: #37474f;
+      margin: 1.5rem 0 1rem 0;
+      text-transform: uppercase;
+      letter-spacing: 0.04rem;
+    }
+    .q-content { display: flex; gap: 16px; align-items: flex-start; }
+    .q-image-wrap { flex: 0 0 580px; }
+    .q-image { max-width: 100%; height: auto; max-height: 540px; object-fit: contain; border-radius: 6px; box-shadow: 0 1px 6px #0001; }
+    .q-body { flex: 1 1 auto; min-width: 0; }
+    .q-text {
+      text-align: left;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+    .answer-pill {
+      display: inline-block;
+      padding: 0.25rem 0.5rem;
+      border-radius: 999px;
+      background: #e3f2fd;
+      color: #1565c0;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    @media (max-width: 768px) {
+      .q-content { flex-direction: column; }
+      .q-image-wrap { flex: 0 0 auto; max-width: 100%; }
+      .col-sr, .col-question, .col-answer, .col-marks, .col-action { width: auto; }
+    }
+    .stats-container {
+      background: #fff;
+      border-radius: 1rem;
+      box-shadow: 0 2px 16px #0001;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .stats-header {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: #0288d1;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+    .stats-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .stats-table th, .stats-table td {
+      padding: 0.75rem;
+      text-align: left;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .stats-table th {
+      background: #f5f5f5;
+      font-weight: 600;
+      color: #37474f;
+    }
+    .stats-table td {
+      color: #555;
+    }
+    .total-row {
+      background: #e3f2fd;
+      font-weight: 600;
+      color: #0288d1;
+    }
+    .subject-count {
+      text-align: center;
+      font-weight: 600;
+      color: #1565c0;
+    }
+  </style>
+</head>
+<br><br>
+<div class="container">
+  <!-- Test Name Header (centered like 'Questions') -->
+  <div class="table-header">{{ course.course_name }}</div>
+  <!-- Statistics Section -->
+  <div class="stats-container">
+    <div class="stats-header">Test Statistics</div>
+    <table class="stats-table">
+      <thead>
+        <tr>
+          <th>Subject</th>
+          <th class="subject-count">Question Count</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% regroup questions by subject as subject_stats %}
+        {% for group in subject_stats %}
+        <tr>
+          <td>{{ group.grouper }}</td>
+          <td class="subject-count">{{ group.list|length }}</td>
+        </tr>
+        {% endfor %}
+        <tr class="total-row">
+          <td><strong>Total Questions</strong></td>
+          <td class="subject-count"><strong>{{ questions|length }}</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-header">Questions</div>
+  <div class="table-container">
+    {% regroup questions by subject as subject_groups %}
+    {% for group in subject_groups %}
+      <div class="subject-section-title">{{ group.grouper }}</div>
+      <table class="table table-hover">
+        <thead>
+          <tr>
+            <th class="col-sr">Sr.</th>
+            <th class="col-question">Questions</th>
+            <th class="col-answer">Answer</th>
+            <th class="col-marks">Marks</th>
+            <th class="col-action">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in group.list %}
+          <tr>
+            <td class="col-sr">{{ forloop.counter }}</td>
+            <td class="col-question">
+              <div class="q-content">
+                {% if c.image %}
+                  <div class="q-image-wrap">
+                    <img class="q-image" src="{{ c.image.url }}" alt="Question Image" />
+                  </div>
+                {% endif %}
+              </div>
+            </td>
+            <td class="col-answer">
+              {% if c.answer_type == 'NUMERIC' %}
+                <span class="answer-pill">{{ c.numeric_answer }}</span>
+              {% elif c.answer_type == 'MULTISELECT' %}
+                {% if c.correct_options %}
+                  <span class="answer-pill">{{ c.correct_options|join:', ' }}</span>
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              {% else %}
+                {% if c.correct_answer == 'A' %}
+                  <span class="answer-pill">A</span>
+                {% elif c.correct_answer == 'B' %}
+                  <span class="answer-pill">B</span>
+                {% elif c.correct_answer == 'C' %}
+                  <span class="answer-pill">C</span>
+                {% elif c.correct_answer == 'D' %}
+                  <span class="answer-pill">D</span>
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              {% endif %}
+            </td>
+            <td class="col-marks">{{ c.marks|default:course.marks_per_question }}</td>
+            <td class="col-action">
+              {% if c.image %}
+                <a class="btn btn-primary btn-xs" href="{% url 'crop-question' c.id %}" title="Crop Image" style="margin-right: 5px;">
+                  <i class="fas fa-crop"></i>
+                </a>
+              {% endif %}
+              <a class="btn btn-danger btn-xs" href="{% url 'delete-question' c.id  %}" title="Delete Question">
+                <i class="fas fa-trash"></i>
+              </a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+  </div>
+</div>
+
+<br><br><br><br><br><br>
+{% endblock content %}
