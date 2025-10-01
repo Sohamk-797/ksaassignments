@@ -740,6 +740,8 @@ def admin_add_question_view(request):
         else:
             # Stay on the same page and display errors
             return render(request,'exam/admin_add_question.html',{'questionForm':questionForm})
+    # GET request or after initializing the empty form
+    return render(request,'exam/admin_add_question.html',{'questionForm':questionForm})
 
 
 @login_required(login_url='adminlogin')
