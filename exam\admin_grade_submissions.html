@@ -1,0 +1,18 @@
+{% extends 'exam/adminbase.html' %}
+{% block content %}
+<div class="container py-4">
+  <h2 class="mb-4 text-primary">Grade Student Submissions</h2>
+  <form method="get" class="row g-2 mb-3">
+    <div class="col-auto">
+      <label for="batch" class="form-label">Batch</label>
+      <select class="form-select" name="batch" id="batch" onchange="this.form.submit()">
+        <option value="">-- Select Batch --</option>
+        {% for b in batches %}
+          <option value="{{b}}" {% if selected_batch == b %}selected{% endif %}>{{b}}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </form>
+  <div class="alert alert-info">This page will display one table per assignment for the selected batch with student attempts and a View Submission action.</div>
+</div>
+{% endblock %}
