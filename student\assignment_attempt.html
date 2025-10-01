@@ -1,0 +1,164 @@
+{% extends 'student/studentbase.html' %}
+{% block exam_mode %}{% with True as exam_mode %}{% endwith %}{% endblock %}
+{% block content %}
+<style>
+  .attempt-topbar { display:flex; justify-content: space-between; align-items:center; margin-bottom: 8px; }
+  .attempt-wrap { display: flex; gap: 16px; height: calc(100vh - 90px); }
+  .attempt-left { flex: 0 0 60%; height: 100%; background: #fff; border: 1px solid #e5e5e5; border-radius: .5rem; overflow: hidden; }
+  .attempt-right { flex: 1; height: 100%; background: #fff; border: 1px solid #e5e5e5; border-radius: .5rem; padding: 12px; overflow: auto; }
+  .pdf-frame { width: 100%; height: 100%; border: 0; display:block; }
+  .subject-block { margin-bottom: 16px; }
+  .subject-title { font-weight: 600; color: #01579b; margin-bottom: 8px; }
+  .q-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .q-cell { display: flex; align-items: center; gap: 6px; }
+  .q-cell input[type="text"] { width: 46px; text-transform: uppercase; text-align: center; }
+  /* Lighter placeholder for A-D */
+  .resp-input::placeholder { color: rgba(0,0,0,0.18) !important; }
+  .resp-input::-webkit-input-placeholder { color: rgba(0,0,0,0.18) !important; }
+  .resp-input::-moz-placeholder { color: rgba(0,0,0,0.18) !important; opacity: 1; }
+  .resp-input:-ms-input-placeholder { color: rgba(0,0,0,0.18) !important; }
+  .resp-input::-ms-input-placeholder { color: rgba(0,0,0,0.18) !important; }
+</style>
+<div class="container-fluid py-3">
+  <div class="attempt-topbar">
+    <a href="/assignments/" class="btn btn-sm btn-outline-secondary">&larr; Return to Assignments</a>
+    <div class="text-muted small">Attempting: {{ assignment.name }}</div>
+  </div>
+  <div id="attempt-root" class="attempt-wrap" data-assignment-id="{{ assignment.id|default:0 }}">
+    <div class="attempt-left">
+      {% if assignment.questions_pdf %}
+        <iframe class="pdf-frame" src="{{ assignment.questions_pdf.url }}"></iframe>
+      {% else %}
+        <div class="p-3 text-muted">Questions PDF not uploaded.</div>
+      {% endif %}
+    </div>
+    <div class="attempt-right">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="m-0">{{ assignment.name }}</h5>
+        <div>
+          <button class="btn btn-outline-secondary btn-sm" id="btn-save">Save</button>
+          <button class="btn btn-primary btn-sm" id="btn-submit">Submit</button>
+        </div>
+      </div>
+      {% for subj, rng in ranges.items %}
+        <div class="subject-block">
+          <div class="subject-title">{{ subj }} ({{ rng|length }})</div>
+          <div class="q-grid">
+            {% for n in rng %}
+              <div class="q-cell">
+                <label class="form-label m-0">{{ n }}.</label>
+                <input class="form-control form-control-sm resp-input" data-subj="{{ subj|lower }}" data-index="{{ forloop.counter0 }}" maxlength="1" pattern="[a-dA-D]" placeholder="A-D" />
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      {% empty %}
+        <div class="text-muted">No subjects configured for this assignment.</div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const rootEl = document.getElementById('attempt-root');
+  const assignmentId = parseInt((rootEl && rootEl.getAttribute('data-assignment-id')) || '0', 10);
+  function getCookie(name) {
+    const value = `; ${document.cookie}`;
+    const parts = value.split(`; ${name}=`);
+    if (parts.length === 2) return parts.pop().split(';').shift();
+  }
+  function normalize(el){
+    if(!el) return; el.value = (el.value||'').trim().toUpperCase();
+    if(el.value && !/^[A-D]$/.test(el.value)) { el.value = ''; }
+  }
+  document.querySelectorAll('.resp-input').forEach(function(inp){
+    inp.addEventListener('blur', function(){ normalize(inp); });
+    inp.addEventListener('input', function(){
+      if (inp.value && inp.value.length >= 1) { normalize(inp); }
+    });
+  });
+  function collectResponses() {
+    const buckets = { physics: [], chemistry: [], maths: [], biology: [] };
+    document.querySelectorAll('.resp-input').forEach(function(inp){
+      const subj = inp.getAttribute('data-subj');
+      const idx = parseInt(inp.getAttribute('data-index'), 10);
+      if (isNaN(idx) || !subj) return;
+      if (!Array.isArray(buckets[subj])) buckets[subj] = [];
+      while (buckets[subj].length <= idx) buckets[subj].push(null);
+      const v = (inp.value || '').trim().toUpperCase();
+      buckets[subj][idx] = (/^[A-D]$/.test(v) ? v : null);
+    });
+    return buckets;
+  }
+  async function postJSON(url, payload) {
+    const csrftoken = getCookie('csrftoken');
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': csrftoken || ''
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      const msg = (data && (data.error || data.message)) || ('Request failed: ' + res.status);
+      throw new Error(msg);
+    }
+    return data;
+  }
+  (function(){
+    var saveBtn = document.getElementById('btn-save');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async function(ev){
+        ev.preventDefault();
+        try {
+          const responses = collectResponses();
+          await postJSON('/assignments/api/save', { assignment_id: assignmentId, responses });
+          if (saveBtn) {
+            const prev = saveBtn.textContent || 'Save';
+            saveBtn.textContent = 'Saved';
+            setTimeout(function(){ if (saveBtn) saveBtn.textContent = prev; }, 1200);
+          }
+        } catch (err) {
+          alert('Save failed: ' + (err && err.message ? err.message : err));
+        }
+      });
+    }
+    var submitBtn = document.getElementById('btn-submit');
+    if (submitBtn) {
+      submitBtn.addEventListener('click', async function(ev){
+        ev.preventDefault();
+        if(!confirm('Submit this attempt? You can attempt again later as attempts are unlimited.')) return;
+        try {
+          const responses = collectResponses();
+          const data = await postJSON('/assignments/api/submit', { assignment_id: assignmentId, responses });
+          if (data.redirect_url) {
+            window.location = data.redirect_url;
+          } else {
+            alert('Submitted, but no redirect provided.');
+          }
+        } catch (err) {
+          alert('Submit failed: ' + (err && err.message ? err.message : err));
+        }
+      });
+    }
+  })();
+  // Prefill from server draft
+  try {
+    const draft = JSON.parse('{{ draft_json|escapejs }}');
+    if (draft && typeof draft === 'object') {
+      Object.keys(draft).forEach(function(subj){
+        const arr = Array.isArray(draft[subj]) ? draft[subj] : [];
+        for (let i = 0; i < arr.length; i++) {
+          const v = (arr[i] == null ? '' : String(arr[i]).toUpperCase());
+          const sel = '.resp-input[data-subj="' + subj + '"][data-index="' + i + '"]';
+          const inp = document.querySelector(sel);
+          if (inp) inp.value = (/^[A-D]$/.test(v) ? v : '');
+        }
+      });
+    }
+  } catch(e) { /* ignore */ }
+})();
+</script>
+{% endblock %}
