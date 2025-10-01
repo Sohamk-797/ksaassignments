@@ -1,0 +1,116 @@
+{% extends 'exam/adminbase.html' %}
+{% block content %}
+<div class="container py-4">
+  <h2 class="mb-4 text-primary">Create Assignment</h2>
+
+  {% if errors %}
+    <div class="alert alert-danger">
+      <ul class="mb-0">
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if success and assignment %}
+    <div class="card border-success mb-3">
+      <div class="card-header bg-success text-white">Assignment Created</div>
+      <div class="card-body">
+        <p class="mb-1"><strong>ID:</strong> {{ assignment.id }}</p>
+        <p class="mb-1"><strong>Name:</strong> {{ assignment.name }}</p>
+        <p class="mb-1"><strong>Batches:</strong> {{ assignment.get_batches_list|join:', ' }}</p>
+        <p class="mb-2"><strong>Total Questions:</strong> {{ assignment.total_questions }}</p>
+        <a class="btn btn-outline-primary btn-sm" href="{{ preview_answers_url }}">Preview Parsed Answers</a>
+      </div>
+    </div>
+  {% endif %}
+
+  <form id="create-assignment-form" method="post" enctype="multipart/form-data" novalidate>
+    {% csrf_token %}
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label">Batches <span class="text-danger">*</span></label>
+        <select class="form-select" name="batches" multiple required>
+          {% for b in batch_choices %}
+            <option value="{{ b }}" {% if selected_batches and b in selected_batches %}selected{% endif %}>{{ b }}</option>
+          {% endfor %}
+        </select>
+        <div class="form-text">Hold Ctrl/Cmd to select multiple.</div>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Assignment Name <span class="text-danger">*</span></label>
+        <input type="text" class="form-control" name="name" value="{{ form_values.name|default:'' }}" required maxlength="200">
+      </div>
+
+      <div class="col-md-3">
+        <label class="form-label"># Physics</label>
+        <input type="number" class="form-control" name="num_physics" min="0" step="1" value="{{ form_values.num_physics|default:'0' }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label"># Chemistry</label>
+        <input type="number" class="form-control" name="num_chemistry" min="0" step="1" value="{{ form_values.num_chemistry|default:'0' }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label"># Maths</label>
+        <input type="number" class="form-control" name="num_maths" min="0" step="1" value="{{ form_values.num_maths|default:'0' }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label"># Biology</label>
+        <input type="number" class="form-control" name="num_biology" min="0" step="1" value="{{ form_values.num_biology|default:'0' }}">
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Questions PDF</label>
+        <input type="file" class="form-control" name="questions_pdf" accept="application/pdf,.pdf">
+        <div class="form-text">Stored under media/assignments/&lt;slug&gt;/</div>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Answers PDF</label>
+        <input type="file" class="form-control" name="answers_pdf" accept="application/pdf,.pdf">
+      </div>
+    </div>
+
+    <div class="mt-3 d-flex gap-2">
+      <button type="submit" class="btn btn-primary">Save Assignment</button>
+      <a href="/admin/assignments/" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<script>
+(function(){
+  const form = document.getElementById('create-assignment-form');
+  if(!form) return;
+  form.addEventListener('submit', function(e){
+    // HTML5 validation
+    if(!form.checkValidity()){
+      e.preventDefault(); e.stopPropagation();
+      form.classList.add('was-validated');
+      return false;
+    }
+    // Validate counts are non-negative integers
+    const intFields = ['num_physics','num_chemistry','num_maths','num_biology'];
+    for (const k of intFields){
+      const el = form.querySelector(`[name="${k}"]`);
+      if(el && el.value){
+        const v = Number(el.value);
+        if(!Number.isInteger(v) || v < 0){
+          e.preventDefault(); e.stopPropagation();
+          alert('Question counts must be non-negative integers');
+          el.focus();
+          return false;
+        }
+      }
+    }
+    // Validate file types if present
+    const fileOk = (f) => !f || (f.type === 'application/pdf' || (f.name||'').toLowerCase().endsWith('.pdf'));
+    const qf = form.querySelector('[name="questions_pdf"]').files[0];
+    const af = form.querySelector('[name="answers_pdf"]').files[0];
+    if(!fileOk(qf) || !fileOk(af)){
+      e.preventDefault(); e.stopPropagation();
+      alert('Uploaded files must be PDF.');
+      return false;
+    }
+  });
+})();
+</script>
+{% endblock %}
