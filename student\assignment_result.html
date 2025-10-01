@@ -1,0 +1,38 @@
+{% extends 'student/studentbase.html' %}
+{% block content %}
+<div class="container py-4">
+  <h3 class="mb-3 text-primary">Assignment Result</h3>
+  <div class="mb-2"><strong>Assignment:</strong> {{ assignment.name }}</div>
+  {% if latest %}
+    <div class="card mb-3">
+      <div class="card-header">Latest Attempt Summary</div>
+      <div class="card-body">
+        <div class="mb-1"><strong>Attempt #:</strong> {{ latest.attempt_no }}</div>
+        <div class="mb-1"><strong>Score:</strong> {{ latest.score_total }}</div>
+        {% if latest.subject_breakdown %}
+          <div class="table-responsive">
+            <table class="table table-sm table-striped">
+              <thead><tr><th>Subject</th><th>Attempted</th><th>Correct</th><th>Marks</th></tr></thead>
+              <tbody>
+                {% for subj, row in latest.subject_breakdown.items %}
+                  <tr>
+                    <td>{{ subj }}</td>
+                    <td>{{ row.attempted|default:0 }}</td>
+                    <td>{{ row.correct|default:0 }}</td>
+                    <td>{{ row.marks|default:0 }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="text-muted">Grading details will appear here after submission logic is completed.</div>
+        {% endif %}
+      </div>
+    </div>
+  {% else %}
+    <div class="alert alert-info">You have not attempted this assignment yet.</div>
+  {% endif %}
+  <a href="/assignments/" class="btn btn-secondary">Back to Assignments</a>
+</div>
+{% endblock %}
