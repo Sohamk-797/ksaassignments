@@ -1,0 +1,89 @@
+{% extends 'exam/adminbase.html' %}
+{% block content %}
+<div class="container py-3">
+  <h4 class="mb-3">Add Notes</h4>
+  {% if error %}
+    <div class="alert alert-danger">{{ error }}</div>
+  {% endif %}
+  {% if success and saved_note %}
+    <div class="alert alert-success">
+      <div class="d-flex justify-content-between align-items-center">
+        <div>
+          <strong>Uploaded:</strong> {{ saved_note.title }}<br>
+          <small>
+            <strong>ID:</strong> {{ saved_note.id }} | 
+            <strong>Slug:</strong> {{ saved_note.slug }} | 
+            <strong>Uploaded At:</strong> {{ saved_note.uploaded_at|date:'Y-m-d H:i' }} | 
+            <strong>Batches:</strong> {% for b in saved_note.batches.all %}{{ b.name }}{% if not forloop.last %}, {% endif %}{% endfor %}
+          </small>
+        </div>
+        <div>
+          <a class="btn btn-sm btn-outline-primary" target="_blank" href="/admin/notes/view/{{ saved_note.slug }}/">Preview</a>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <form method="post" enctype="multipart/form-data" novalidate>
+        {% csrf_token %}
+        <div class="mb-3">
+          <label class="form-label">Batches (required)</label>
+          <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 g-2">
+            <div class="col">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="batch_all" name="batches" value="ALL">
+                <label class="form-check-label" for="batch_all">All Batches</label>
+              </div>
+            </div>
+            {% for name in fixed_batches %}
+            <div class="col">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="batch_{{ forloop.counter }}" name="batches" value="{{ name }}" {% if name in selected_batches %}checked{% endif %}>
+                <label class="form-check-label" for="batch_{{ forloop.counter }}">{{ name }}</label>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="mb-3">
+          <label for="title" class="form-label">Notes Title (required)</label>
+          <input type="text" id="title" name="title" class="form-control" placeholder="Enter title" required>
+        </div>
+        <div class="mb-3">
+          <label for="description" class="form-label">Description (optional)</label>
+          <textarea id="description" name="description" class="form-control" rows="3" placeholder="Short description (optional)"></textarea>
+        </div>
+        <div class="mb-3">
+          <label for="file" class="form-label">PDF File (required, .pdf, max 50 MB)</label>
+          <input class="form-control" type="file" id="file" name="file" accept="application/pdf,.pdf" required>
+        </div>
+        <div class="d-flex gap-2">
+          <button type="submit" class="btn btn-primary">Upload</button>
+          <a class="btn btn-outline-secondary" href="/admin/notes/">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<script>
+// Minimal client-side validation
+(function(){
+  const form = document.querySelector('form');
+  form.addEventListener('submit', function(e){
+    const batchChecks = document.querySelectorAll('input[name="batches"]:checked');
+    const title = document.getElementById('title');
+    const file = document.getElementById('file');
+    if (!batchChecks || batchChecks.length === 0) {
+      e.preventDefault(); alert('Please select at least one Batch.'); return false;
+    }
+    if (!title.value.trim()) { e.preventDefault(); alert('Please enter a title.'); return false; }
+    if (!file.files || file.files.length === 0) { e.preventDefault(); alert('Please choose a PDF file.'); return false; }
+    const f = file.files[0];
+    if (f && f.type && f.type.indexOf('pdf') === -1) { e.preventDefault(); alert('Please upload a valid PDF file.'); return false; }
+    // 50MB limit (configurable; kept client-side as hint)
+    if (f && f.size > 50 * 1024 * 1024) { e.preventDefault(); alert('File too large (max 50 MB).'); return false; }
+  });
+})();
+</script>
+{% endblock %}
