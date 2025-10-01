@@ -1,0 +1,41 @@
+{% extends 'student/studentbase.html' %}
+{% load dict_extras %}
+{% block content %}
+<div class="container py-4">
+  <h3 class="mb-3 text-primary">Assignments</h3>
+  <div class="table-responsive">
+    <table class="table table-striped align-middle">
+      <thead>
+        <tr>
+          <th>Assignment</th>
+          <th>Attempt Assignment</th>
+          <th>View Result</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in assignments %}
+        <tr>
+          <td>{{ a.name }}</td>
+          <td>
+            <a class="btn btn-sm btn-primary" href="/assignments/attempt/{{ a.id }}/">Attempt Assignment</a>
+          </td>
+          <td>
+            {% with meta=attempts_by_assignment|get_item:a.id %}
+              {% if meta and meta.count %}
+                <a class="btn btn-sm btn-outline-success" href="/assignments/result/{{ a.id }}/">View Result</a>
+              {% else %}
+                <span class="text-muted">No attempts yet</span>
+              {% endif %}
+            {% endwith %}
+          </td>
+        </tr>
+        {% empty %}
+        <tr>
+          <td colspan="3" class="text-muted">No assignments available.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
