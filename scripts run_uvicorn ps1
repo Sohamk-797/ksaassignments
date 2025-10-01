@@ -1,0 +1,115 @@
+param(
+    [int]$Port = 8000,
+    # Windows + uvicorn multi-process can be unstable (WinError 10022). Default to 1.
+    [int]$Workers = 2,
+    [switch]$Migrate,
+    [switch]$NoCollectStatic,
+    # Serve MEDIA via Django for ASGI runs unless explicitly disabled
+    [switch]$ServeMedia = $true,
+    [string]$BindIp = '192.168.1.6',
+    # Suppress opening a browser tab (useful when launching many instances)
+    [switch]$NoOpenBrowser
+)
+
+# Set working directory to project root (this script resides in scripts/)
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = Split-Path -Parent $ScriptDir
+Set-Location $ProjectRoot
+
+# Ensure Python is available
+$python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $python) {
+    Write-Error 'Python not found in PATH. Please ensure your virtual environment is activated.'
+    exit 1
+}
+
+# Show LAN IPs for convenience
+Write-Host 'Detected IPv4 addresses:' -ForegroundColor Cyan
+Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.AddressFamily -eq 'IPv4' -and $_.IPAddress -notmatch '^127\.' } |
+    Select-Object IPAddress, InterfaceAlias |
+    Format-Table -AutoSize
+
+# Set Django settings if not set
+if (-not $Env:DJANGO_SETTINGS_MODULE) {
+    $Env:DJANGO_SETTINGS_MODULE = 'onlinexam.settings'
+}
+
+# Force production defaults unless explicitly overridden by caller
+if (-not $Env:DJANGO_DEBUG -or "$Env:DJANGO_DEBUG".Trim() -eq '') {
+    $Env:DJANGO_DEBUG = 'false'
+}
+
+# Optional DB migrations
+if ($Migrate) {
+    Write-Host 'Applying migrations...' -ForegroundColor Yellow
+    python manage.py migrate
+}
+
+# Collect static files (uses WhiteNoise in prod)
+if (-not $NoCollectStatic) {
+    Write-Host 'Collecting static files...' -ForegroundColor Yellow
+    python manage.py collectstatic --noinput
+}
+
+# Ensure MEDIA is served by Django under uvicorn when requested
+if ($ServeMedia) {
+    $Env:SERVE_MEDIA = '1'
+    Write-Host 'Enabling Django media serving (SERVE_MEDIA=1)' -ForegroundColor Yellow
+}
+
+# Enable static file serving via Uvicorn (replaces Caddy functionality)
+$Env:SERVE_STATIC = '1'
+Write-Host 'Enabling Django static file serving (SERVE_STATIC=1)' -ForegroundColor Yellow
+
+# Start Uvicorn ASGI server
+$HostBind = if ($BindIp -and $BindIp.Trim() -ne '') { $BindIp.Trim() } else { '0.0.0.0' }
+$App = 'onlinexam.asgi:application'
+
+# Prepare allowed hosts and CSRF trusted origins based on bind host and local hostname
+$HostList = @('localhost','127.0.0.1',$env:COMPUTERNAME)
+if ($HostBind -and $HostBind -ne '0.0.0.0') { $HostList += $HostBind }
+$Env:DJANGO_ALLOWED_HOSTS = ($HostList | Sort-Object -Unique) -join ','
+
+# CSRF trusted origins require scheme://host[:port]
+$Origins = @()
+foreach ($h in $HostList | Sort-Object -Unique) {
+    $Origins += "http://${h}"
+    $Origins += "http://${h}:$Port"
+}
+$Env:DJANGO_CSRF_TRUSTED_ORIGINS = ($Origins | Sort-Object -Unique) -join ','
+
+# Notes:
+# - --workers: parallel processes; 2-4 is plenty for ~35 students on your CPU
+# - --limit-concurrency: backpressure guard
+# - --timeout-keep-alive: keep connections for HTTP/1.1
+# - --proxy-headers: not needed on LAN (no reverse proxy)
+
+
+
+$Args = @(
+  $App,
+  '--host', $HostBind,
+  '--port', $Port,
+  '--workers', $Workers,
+  '--loop', 'asyncio',
+  '--http', 'h11',
+  '--timeout-keep-alive', '75',
+  '--limit-concurrency', '100',
+  '--log-level', 'info'
+)
+
+Write-Host ("Starting Uvicorn on http://{0}:{1} ..." -f $HostBind, $Port) -ForegroundColor Green
+Write-Host ("Student URL (hostname):  http://{0}:{1}" -f $env:COMPUTERNAME, $Port) -ForegroundColor Cyan
+if ($BindIp -and $BindIp.Trim() -ne '') {
+    Write-Host ("Student URL (fixed IP): http://{0}:{1}" -f $BindIp.Trim(), $Port) -ForegroundColor Cyan
+}
+
+# Open admin's browser automatically to the local access URL
+$AdminUrl = if ($BindIp -and $BindIp.Trim() -ne '') { ("http://{0}:{1}/" -f $BindIp.Trim(), $Port) } else { ("http://localhost:{0}/" -f $Port) }
+if (-not $NoOpenBrowser) {
+    Write-Host ("Opening admin browser: {0}" -f $AdminUrl) -ForegroundColor Yellow
+    Start-Process $AdminUrl
+}
+
+python -m uvicorn @Argsju
