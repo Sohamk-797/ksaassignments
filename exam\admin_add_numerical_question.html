@@ -1,0 +1,125 @@
+{% extends 'exam/adminbase.html' %}
+{% load widget_tweaks %}
+{% block content %}
+<head>
+  <style>
+    .form-header { font-size: 2rem; font-weight: 600; color: #0288d1; margin: 2rem 0 1.5rem 0; text-align: center; }
+    .form-container { background:#fff; border-radius:1rem; box-shadow:0 2px 16px #0001; padding:2rem 2.5rem; max-width: 820px; margin:2rem auto; border:none; }
+    .form-group label { font-weight:500; color:#01579b; }
+    .btn-success, .btn-primary { border-radius:0.5rem; font-size:1.1rem; padding:0.6rem 2rem; border:none; }
+    .btn-success { background:#43a047; }
+    .btn-success:hover { background:#1b5e20; }
+    .btn-primary { background:#0288d1; }
+    .btn-primary:hover { background:#01579b; }
+    .help { font-size: 0.9rem; color:#666; }
+    @media (max-width: 700px) { .form-container { padding: 1rem 0.5rem; } }
+    .hidden { display:none; }
+  </style>
+</head>
+<div class="form-header">Add Numerical Question</div>
+<div class="form-container">
+  {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
+  {% if success %}<div class="alert alert-success">{{ success }}</div>{% endif %}
+  <form method="POST" enctype="multipart/form-data" autocomplete="off" id="numq-form">
+    {% csrf_token %}
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label>Test</label>
+        {% render_field form.courseID|attr:'required:true' class="form-select" %}
+      </div>
+      <div class="col-md-6">
+        <label>Answer Type</label>
+        {% render_field form.answer_type|attr:'required:true' class="form-select" id="answerType" %}
+      </div>
+    </div>
+    <!-- Subject and Question removed: subject is forced to 'Numericals' and image is mandatory -->
+    <div class="form-group mt-3">
+      <label>Question Image <span style="color:#d32f2f">*</span></label>
+      {% render_field form.image|attr:'required:true' class="form-control" %}
+      <div class="help">Images are saved under media/questions/&lt;test-slug&gt;/&lt;subject&gt;/ with unique timestamped names.</div>
+    </div>
+    <div class="form-group mt-3">
+      <label>Marks</label>
+      {% render_field form.marks|attr:'required:true' class="form-control" placeholder="e.g. 1" %}
+    </div>
+
+    <div id="numericFields" class="mt-3">
+      <label>Numeric Answer (whole number)</label>
+      {% render_field form.numeric_answer class="form-control" min="0" step="1" %}
+      <div class="help">Enter a non-negative whole number (0, 1, 2, ...)</div>
+    </div>
+
+    <div id="optionsFields" class="mt-3">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <label>Option A</label>
+          {% render_field form.option_a class="form-control" placeholder="Option A" %}
+        </div>
+        <div class="col-md-6">
+          <label>Option B</label>
+          {% render_field form.option_b class="form-control" placeholder="Option B" %}
+        </div>
+        <div class="col-md-6">
+          <label>Option C</label>
+          {% render_field form.option_c class="form-control" placeholder="Option C" %}
+        </div>
+        <div class="col-md-6">
+          <label>Option D</label>
+          {% render_field form.option_d class="form-control" placeholder="Option D" %}
+        </div>
+      </div>
+      <div id="mcqCorrect" class="mt-3">
+        <label>Correct Answer (MCQ)</label>
+        {% render_field form.correct_answer class="form-select" %}
+      </div>
+      <div id="multiCorrect" class="mt-3">
+        <label>Correct Options (Multi-select)</label>
+        <div class="form-check">
+          {% for val,label in form.correct_options.field.choices %}
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="checkbox" name="correct_options" id="multi_{{ val }}" value="{{ val }}">
+              <label class="form-check-label" for="multi_{{ val }}">{{ label }}</label>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-4">
+      <button type="submit" class="btn btn-success">Submit Question</button>
+      <button type="submit" name="save_next" class="btn btn-primary" style="margin-left:10px;">Save and Next</button>
+    </div>
+  </form>
+</div>
+<script>
+(function(){
+  function applyVisibility(){
+    var at = document.getElementById('answerType').value;
+    var numeric = document.getElementById('numericFields');
+    var options = document.getElementById('optionsFields');
+    var mcq = document.getElementById('mcqCorrect');
+    var multi = document.getElementById('multiCorrect');
+    if (at === 'NUMERIC'){
+      numeric.classList.remove('hidden');
+      options.classList.add('hidden');
+      mcq.classList.add('hidden');
+      multi.classList.add('hidden');
+    } else if (at === 'MULTISELECT'){
+      numeric.classList.add('hidden');
+      options.classList.remove('hidden');
+      mcq.classList.add('hidden');
+      multi.classList.remove('hidden');
+    } else { // MCQ
+      numeric.classList.add('hidden');
+      options.classList.remove('hidden');
+      mcq.classList.remove('hidden');
+      multi.classList.add('hidden');
+    }
+  }
+  document.addEventListener('DOMContentLoaded', function(){
+    document.getElementById('answerType').addEventListener('change', applyVisibility);
+    applyVisibility();
+  });
+})();
+</script>
+{% endblock content %}
