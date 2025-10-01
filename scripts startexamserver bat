@@ -1,0 +1,23 @@
+@echo off
+REM Start Django ASGI server (Uvicorn) for LAN exam use
+REM This script can be double-clicked. It will open a console and run the server.
+
+setlocal ENABLEDELAYEDEXPANSION
+
+REM Determine project root (this file is in scripts\)
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..") do set "PROJECT_ROOT=%%~fI"
+
+pushd "%PROJECT_ROOT%"
+
+REM If you use a virtual environment, optionally activate it by uncommenting:
+call "%PROJECT_ROOT%\venv\Scripts\activate.bat"
+
+REM Run the PowerShell launcher with sensible defaults
+REM Workers: use 2 for light parallelism on Windows (the PS1 clamps to 1-2 for stability)
+powershell -ExecutionPolicy Bypass -NoLogo -NoProfile -File "%PROJECT_ROOT%\scripts\run_uvicorn.ps1" -Port 8000 -Workers 2 -BindIp 192.168.1.6
+
+REM Keep window open if the server exits
+pause
+
+endlocal
